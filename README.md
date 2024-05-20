@@ -1,2 +1,2 @@
 # transtimegrad
-Transformer based Time-Grad model
+Transformer based Time-Grad model.
