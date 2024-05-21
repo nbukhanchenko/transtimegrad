@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ttg.util import get_lags_for_frequency, lagged_sequence_values
+from ...util import get_lags_for_frequency, lagged_sequence_values
 from ..epsilon_theta import EpsilonTheta
 
 

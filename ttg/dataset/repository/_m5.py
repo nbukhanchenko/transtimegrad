@@ -9,7 +9,7 @@ from gluonts.dataset.common import MetaData, TrainDatasets
 from gluonts.dataset.repository._util import metadata
 from gluonts.time_feature.holiday import squared_exponential_kernel
 
-from ttg.feature import CustomDateFeatureSet
+from ...feature import CustomDateFeatureSet
 
 
 def generate_pts_m5_dataset(
