@@ -1,3 +1,4 @@
+#@title TransTimeGradModel
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -26,8 +27,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ...util import get_lags_for_frequency, lagged_sequence_values
-from ..epsilon_theta import EpsilonTheta
+from ttg.util import get_lags_for_frequency, lagged_sequence_values
+from ttg.model.epsilon_theta import EpsilonTheta
 
 
 # # adapation of pytorch documentation
@@ -76,9 +77,9 @@ class Decoder(nn.Module):
     ):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
+            nn.Linear(input_size, hidden_size, dtype=torch.float64),
             # nn.ReLU(),
-            # nn.Linear(hidden_size, hidden_size),
+            # nn.Linear(hidden_size, hidden_size, dtype=torch.float64),
         )
         # self.pos_enc = PositionalEncoding(
         #     d_model=hidden_size,
@@ -99,7 +100,7 @@ class Decoder(nn.Module):
         return self.decoder(
             tgt=tgt,
             memory=memory,
-            tgt_mask=tgt_mask
+            tgt_mask=tgt_mask,
         )
 
 
@@ -225,11 +226,12 @@ class TransTimeGradModel(nn.Module):
             dim_feedforward=dim_feedforward_to_d_model_ratio*hidden_size,
             dropout=dropout_rate,
             batch_first=True,
+            dtype=torch.float64,
         )
         self.encoder = nn.Sequential(
-            nn.Linear(model_input_size, hidden_size),
+            nn.Linear(model_input_size, hidden_size, dtype=torch.float64),
             # nn.ReLU(),
-            # nn.Linear(hidden_size, hidden_size),
+            # nn.Linear(hidden_size, hidden_size, dtype=torch.float64),
             # PositionalEncoding(
             #     d_model=hidden_size,
             #     max_len=5000,
@@ -246,6 +248,7 @@ class TransTimeGradModel(nn.Module):
             dim_feedforward=dim_feedforward_to_d_model_ratio*hidden_size,
             dropout=dropout_rate,
             batch_first=True,
+            dtype=torch.float64,
         )
         self.decoder = Decoder(
             input_size=self.input_size+self._number_of_features,
@@ -255,7 +258,7 @@ class TransTimeGradModel(nn.Module):
         )
         ########
 
-        self.unet = EpsilonTheta(target_dim=input_size, cond_dim=hidden_size)
+        self.unet = EpsilonTheta(target_dim=input_size, cond_dim=hidden_size).type(torch.float64)
         self.scheduler = scheduler
         self.num_inference_steps = num_inference_steps
 
@@ -428,7 +431,7 @@ class TransTimeGradModel(nn.Module):
             future_target,
         )
 
-        encoder_output = self.encoder(model_input)
+        encoder_output = self.encoder(model_input.type(torch.float64))
 
         return loc, scale, encoder_output, static_feat
 
@@ -529,9 +532,9 @@ class TransTimeGradModel(nn.Module):
                 generate_square_subsequent_mask(feature_samples.size(1)). \
                 to(encoder_output.device)
             decoder_output = self.decoder(
-                tgt=feature_samples,
-                memory=repeated_encoder_output,
-                tgt_mask=target_mask,
+                tgt=feature_samples.type(torch.float64),
+                memory=repeated_encoder_output.type(torch.float64),
+                tgt_mask=target_mask.type(torch.float64),
             )
 
             next_sample = self.sample(decoder_output[:, -1:], loc=repeated_loc, scale=repeated_scale)
@@ -561,7 +564,7 @@ class TransTimeGradModel(nn.Module):
         )
 
         model_output = self.unet(
-            noisy_output, timesteps, model_output.reshape(B * T, 1, -1)
+            noisy_output.type(torch.float64), timesteps.type(torch.float64), model_output.reshape(B * T, 1, -1).type(torch.float64)
         )
         if self.scheduler.config.prediction_type == "epsilon":
             target_noise = noise
@@ -591,7 +594,7 @@ class TransTimeGradModel(nn.Module):
 
         self.scheduler.set_timesteps(self.num_inference_steps)
         for t in self.scheduler.timesteps:
-            model_output = self.unet(sample, t, context.view(B * T, 1, -1))
+            model_output = self.unet(sample.type(torch.float64), t.type(torch.float64), context.view(B * T, 1, -1).type(torch.float64))
             sample = self.scheduler.step(model_output, t, sample).prev_sample
 
         return (sample.view(B, T, -1) * scale) + loc
@@ -652,9 +655,9 @@ class TransTimeGradModel(nn.Module):
             generate_square_subsequent_mask(feature_samples.size(1)). \
             to(encoder_output.device)
         decoder_output = self.decoder(
-            tgt=feature_samples,
-            memory=encoder_output,
-            tgt_mask=target_mask,
+            tgt=feature_samples.type(torch.float64),
+            memory=encoder_output.type(torch.float64),
+            tgt_mask=target_mask.type(torch.float64),
         )
 
         if future_only:
