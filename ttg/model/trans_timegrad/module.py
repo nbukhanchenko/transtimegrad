@@ -142,8 +142,8 @@ class TransTimeGradModel(nn.Module):
         # )
 
         ########
-        nhead = 4
-        dim_feedforward_scale = 2
+        nhead = 8
+        dim_feedforward_scale = 4
         activation = "gelu"
         # distr_output = StudentTOutput()
         
