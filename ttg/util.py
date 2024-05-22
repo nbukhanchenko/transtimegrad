@@ -11,6 +11,7 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
+import inspect
 from typing import List, Optional
 
 from gluonts.time_feature import norm_freq_str
@@ -18,6 +19,7 @@ from gluonts.torch.util import slice_along_dim
 import numpy as np
 from pandas.tseries.frequencies import to_offset
 import torch
+import torch.nn as nn
 
 
 def _make_lags(middle: int, delta: int) -> np.ndarray:
@@ -223,3 +225,43 @@ def lagged_sequence_values(
         lags_values = lags_values.reshape(*lags_values.shape[:-2], -1)
 
     return lags_values
+
+
+def weighted_average(
+    x: torch.Tensor, weights: Optional[torch.Tensor] = None, dim=None
+) -> torch.Tensor:
+    """
+    Computes the weighted average of a given tensor across a given dim, masking
+    values associated with weight zero,
+    meaning instead of `nan * 0 = nan` you will get `0 * 0 = 0`.
+
+    Parameters
+    ----------
+    x
+        Input tensor, of which the average must be computed.
+    weights
+        Weights tensor, of the same shape as `x`.
+    dim
+        The dim along which to average `x`
+
+    Returns
+    -------
+    Tensor:
+        The tensor with values averaged along the specified `dim`.
+    """
+    if weights is not None:
+        weighted_tensor = torch.where(weights != 0, x * weights, torch.zeros_like(x))
+        sum_weights = torch.clamp(
+            weights.sum(dim=dim) if dim else weights.sum(), min=1.0
+        )
+        return (
+            weighted_tensor.sum(dim=dim) if dim else weighted_tensor.sum()
+        ) / sum_weights
+    else:
+        return x.mean(dim=dim)
+
+
+def get_module_forward_input_names(module: nn.Module):
+    params = inspect.signature(module.forward).parameters
+    param_names = [k for k, v in params.items() if not str(v).startswith("*")]
+    return param_names

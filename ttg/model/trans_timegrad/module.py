@@ -1,4 +1,3 @@
-#@title TransTimeGradModel
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -12,8 +11,7 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-import math
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from diffusers import SchedulerMixin
 from diffusers.utils.torch_utils import randn_tensor
@@ -22,86 +20,14 @@ from gluonts.itertools import prod
 from gluonts.model import Input, InputSpec
 from gluonts.torch.modules.feature import FeatureEmbedder
 from gluonts.torch.scaler import MeanScaler, NOPScaler, Scaler, StdScaler
-from gluonts.torch.util import repeat_along_dim, unsqueeze_expand
+from gluonts.torch.util import repeat_along_dim
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ttg.util import get_lags_for_frequency, lagged_sequence_values
-from ttg.model.epsilon_theta import EpsilonTheta
-
-
-# # adapation of pytorch documentation
-# class PositionalEncoding(nn.Module):
-#     def __init__(self, d_model: int, max_len: int = 5000, mode: str = "forward"):
-#         super().__init__()
-#         assert mode in ("forward", "backward")
-#         self.mode = mode
-#         position = torch.arange(max_len).unsqueeze(1)
-#         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-#         pos_enc = torch.zeros(1, max_len, d_model)
-#         pos_enc[0, :, 0::2] = torch.sin(position * div_term)
-#         pos_enc[0, :, 1::2] = torch.cos(position * div_term)
-#         if self.mode == "backward":
-#             pos_enc = -torch.flip(pos_enc, (1,))
-#         self.register_buffer("pos_enc", pos_enc)
-
-#     def _extend_pos_enc(self, zeros: torch.Tensor) -> None:
-#         if self.mode == "forward":
-#             self.pos_enc = torch.cat((
-#                 self.pos_enc, zeros
-#             ), dim=1)
-#         elif self.mode == "backward":
-#             self.pos_enc = torch.cat((
-#                 zeros, self.pos_enc
-#             ), dim=1)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         if x.size(1) > self.pos_enc.size(1): # distant in time positional encodings are zero
-#             zeros = torch.zeros((
-#                 self.pos_enc.size(0),
-#                 x.size(1) - self.pos_enc.size(1),
-#                 self.pos_enc.size(2)
-#             ), device=self.pos_enc.device)
-#             self._extend_pos_enc(zeros)
-#         if self.mode == "forward":
-#             return x + self.pos_enc[:, :x.size(1)]
-#         elif self.mode == "backward":
-#             return x + self.pos_enc[:, -x.size(1):]
-
-
-class Decoder(nn.Module):
-    def __init__(
-        self, input_size: int, hidden_size: int,
-        decoder_layer: "TransformerDecoderLayer", num_layers: int
-    ):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_size, hidden_size, dtype=torch.float64),
-            # nn.ReLU(),
-            # nn.Linear(hidden_size, hidden_size, dtype=torch.float64),
-        )
-        # self.pos_enc = PositionalEncoding(
-        #     d_model=hidden_size,
-        #     max_len=5000,
-        #     mode="forward",
-        # )
-        self.decoder = nn.TransformerDecoder(
-            decoder_layer=decoder_layer,
-            num_layers=num_layers,
-        )
-
-    def forward(
-        self, tgt: torch.Tensor, memory: torch.Tensor,
-        tgt_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        tgt = self.mlp(tgt)
-        # tgt = self.pos_enc(tgt)
-        return self.decoder(
-            tgt=tgt,
-            memory=memory,
-            tgt_mask=tgt_mask,
-        )
+from ..epsilon_theta import EpsilonTheta
+from ..transformer import TransformerModel
+from ...util import get_lags_for_frequency
 
 
 class TransTimeGradModel(nn.Module):
@@ -150,7 +76,6 @@ class TransTimeGradModel(nn.Module):
         Number of samples to produce when unrolling the Model in the prediction
         time range.
     """
-
     @validated()
     def __init__(
         self,
@@ -197,7 +122,7 @@ class TransTimeGradModel(nn.Module):
             else [min(50, (cat + 1) // 2) for cat in cardinality]
         )
         self.lags_seq = lags_seq or get_lags_for_frequency(freq_str=freq)
-        self.lags_seq = [lag - 1 for lag in self.lags_seq]
+        # self.lags_seq = [lag - 1 for lag in self.lags_seq]
         self.num_parallel_samples = num_parallel_samples
         self.past_length = self.context_length + max(self.lags_seq)
         self.embedder = FeatureEmbedder(
@@ -212,50 +137,39 @@ class TransTimeGradModel(nn.Module):
             self.scaler: Scaler = StdScaler(dim=1, keepdim=True)
         else:
             self.scaler: Scaler = NOPScaler(dim=1, keepdim=True)
-        model_input_size = (
-            self.input_size * len(self.lags_seq) + self._number_of_features
-        )
+        # model_input_size = (
+        #     self.input_size * len(self.lags_seq) + self._number_of_features
+        # )
 
         ########
-        nhead = 8
-        dim_feedforward_to_d_model_ratio = 4
+        nhead = 4
+        dim_feedforward_scale = 2
+        activation = "gelu"
+        # distr_output = StudentTOutput()
         
-        encoder_layer = nn.TransformerEncoderLayer(
+        self.encoder_decoder = TransformerModel(
+            freq=freq,
+            context_length=self.context_length,
+            prediction_length=self.prediction_length,
             d_model=hidden_size,
             nhead=nhead,
-            dim_feedforward=dim_feedforward_to_d_model_ratio*hidden_size,
+            num_encoder_layers=num_layers,
+            num_decoder_layers=num_layers,
+            dim_feedforward=dim_feedforward_scale*hidden_size,
+            activation=activation,
             dropout=dropout_rate,
-            batch_first=True,
-            dtype=torch.float64,
-        )
-        self.encoder = nn.Sequential(
-            nn.Linear(model_input_size, hidden_size, dtype=torch.float64),
-            # nn.ReLU(),
-            # nn.Linear(hidden_size, hidden_size, dtype=torch.float64),
-            # PositionalEncoding(
-            #     d_model=hidden_size,
-            #     max_len=5000,
-            #     mode="backward",
-            # ),
-            nn.TransformerEncoder(
-                encoder_layer=encoder_layer,
-                num_layers=num_layers,
-            ),
-        )
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=hidden_size,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward_to_d_model_ratio*hidden_size,
-            dropout=dropout_rate,
-            batch_first=True,
-            dtype=torch.float64,
-        )
-        self.decoder = Decoder(
-            input_size=self.input_size+self._number_of_features,
-            hidden_size=hidden_size,
-            decoder_layer=decoder_layer,
-            num_layers=num_layers,
-        )
+            input_size=input_size,
+            num_feat_dynamic_real=self.num_feat_dynamic_real,
+            num_feat_static_real=self.num_feat_static_real,
+            num_feat_static_cat=self.num_feat_static_cat,
+            cardinality=cardinality,
+            embedding_dimension=self.embedding_dimension,
+            # distr_output=distr_output,
+            lags_seq=self.lags_seq,
+            scaling=scaling,
+            default_scale=default_scale,
+            num_parallel_samples=self.num_parallel_samples,
+        ).type(torch.float64)
         ########
 
         self.unet = EpsilonTheta(target_dim=input_size, cond_dim=hidden_size).type(torch.float64)
@@ -318,123 +232,6 @@ class TransTimeGradModel(nn.Module):
     def _past_length(self) -> int:
         return self.context_length + max(self.lags_seq)
 
-    def prepare_model_input(
-        self,
-        feat_static_cat: torch.Tensor,
-        feat_static_real: torch.Tensor,
-        past_time_feat: torch.Tensor,
-        past_target: torch.Tensor,
-        past_observed_values: torch.Tensor,
-        future_time_feat: torch.Tensor,
-        future_target: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,]:
-        context = past_target[:, -self.context_length:]
-        observed_context = past_observed_values[:, -self.context_length:]
-
-        input, loc, scale = self.scaler(context, observed_context)
-        future_length = future_time_feat.shape[-2]
-        if future_length > 1:
-            assert future_target is not None
-            input = torch.cat(
-                (input, (future_target[:, : future_length - 1, ...] - loc) / scale),
-                dim=1,
-            )
-        prior_input = (past_target[:, : -self.context_length, ...] - loc) / scale
-
-        lags = lagged_sequence_values(self.lags_seq, prior_input, input, dim=1)
-        time_feat = torch.cat(
-            (
-                past_time_feat[:, -self.context_length + 1:, ...],
-                future_time_feat,
-            ),
-            dim=1,
-        )
-
-        embedded_cat = self.embedder(feat_static_cat)
-        log_abs_loc = (
-            loc.abs().log1p() if self.input_size == 1 else loc.squeeze(1).abs().log1p()
-        )
-        log_scale = scale.log() if self.input_size == 1 else scale.squeeze(1).log()
-
-        static_feat = torch.cat(
-            (embedded_cat, feat_static_real, log_abs_loc, log_scale),
-            dim=-1,
-        )
-        expanded_static_feat = unsqueeze_expand(
-            static_feat, dim=1, size=time_feat.shape[-2]
-        )
-
-        features = torch.cat((expanded_static_feat, time_feat), dim=-1)
-
-        return torch.cat((lags, features), dim=-1), loc, scale, static_feat
-
-    def unroll_lagged_model(
-        self,
-        feat_static_cat: torch.Tensor,
-        feat_static_real: torch.Tensor,
-        past_time_feat: torch.Tensor,
-        past_target: torch.Tensor,
-        past_observed_values: torch.Tensor,
-        future_time_feat: torch.Tensor,
-        future_target: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        Tuple[torch.Tensor, ...],
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
-    ]:
-        """
-        Applies the underlying Model to the provided target data and covariates.
-
-        Parameters
-        ----------
-        feat_static_cat
-            Tensor of static categorical features,
-            shape: ``(batch_size, num_feat_static_cat)``.
-        feat_static_real
-            Tensor of static real features,
-            shape: ``(batch_size, num_feat_static_real)``.
-        past_time_feat
-            Tensor of dynamic real features in the past,
-            shape: ``(batch_size, past_length, num_feat_dynamic_real)``.
-        past_target
-            Tensor of past target values,
-            shape: ``(batch_size, past_length)``.
-        past_observed_values
-            Tensor of observed values indicators,
-            shape: ``(batch_size, past_length)``.
-        future_time_feat
-            Tensor of dynamic real features in the future,
-            shape: ``(batch_size, prediction_length, num_feat_dynamic_real)``.
-        future_target
-            (Optional) Tensor of future target values,
-            shape: ``(batch_size, prediction_length)``.
-
-        Returns
-        -------
-        Tuple
-            A tuple containing, in this order:
-            - Parameters of the output distribution
-            - Scaling factor applied to the target
-            - Raw output of the Model
-            - Static input to the Model
-            - (Optional) Output state from the Model
-        """
-        model_input, loc, scale, static_feat = self.prepare_model_input(
-            feat_static_cat,
-            feat_static_real,
-            past_time_feat,
-            past_target,
-            past_observed_values,
-            future_time_feat,
-            future_target,
-        )
-
-        encoder_output = self.encoder(model_input.type(torch.float64))
-
-        return loc, scale, encoder_output, static_feat
-
     def forward(
         self,
         feat_static_cat: torch.Tensor,
@@ -475,77 +272,92 @@ class TransTimeGradModel(nn.Module):
         if num_parallel_samples is None:
             num_parallel_samples = self.num_parallel_samples
 
-        loc, scale, encoder_output, static_feat = self.unroll_lagged_model(
+        encoder_inputs, loc, scale, static_feat = self.encoder_decoder.create_network_inputs(
             feat_static_cat,
             feat_static_real,
             past_time_feat,
             past_target,
             past_observed_values,
-            future_time_feat[:, :1],
+            # future_time_feat[:, :1],
         )
+        enc_pos = self.encoder_decoder.pos_embedding(encoder_inputs.size())
+        enc_out = self.encoder_decoder.transformer.encoder(self.encoder_decoder.enc_embedding(encoder_inputs) + enc_pos)
 
-        repeated_scale = scale.repeat_interleave(repeats=num_parallel_samples, dim=0)
+        repeated_scale = scale.repeat_interleave(
+            repeats=num_parallel_samples, dim=0
+        )
         repeated_loc = loc.repeat_interleave(repeats=num_parallel_samples, dim=0)
 
-        repeated_static_feat = static_feat.repeat_interleave(
-            repeats=num_parallel_samples, dim=0
-        ).unsqueeze(dim=1)
         repeated_past_target = (
             past_target.repeat_interleave(repeats=num_parallel_samples, dim=0)
             - repeated_loc
         ) / repeated_scale
-        repeated_time_feat = future_time_feat.repeat_interleave(
+
+        expanded_static_feat = static_feat.unsqueeze(1).expand(
+            -1, future_time_feat.shape[1], -1
+        )
+        features = torch.cat((expanded_static_feat, future_time_feat), dim=-1)
+        repeated_features = features.repeat_interleave(
             repeats=num_parallel_samples, dim=0
         )
 
-        repeated_encoder_output = encoder_output.repeat_interleave(
+        repeated_enc_out = enc_out.repeat_interleave(
             repeats=num_parallel_samples, dim=0
-        ) # decoder looks at all encoder states or only at the last one?
+        )
 
-        next_sample = self.sample(
-            repeated_encoder_output[:, -1:], loc=repeated_loc, scale=repeated_scale
-        ) # BOS token of decoded sequence
-        next_samples = torch.clone(next_sample)
+        future_samples = []
 
-        next_features = torch.zeros((
-            repeated_static_feat.size(0), 0, self._number_of_features
-        ), device=encoder_output.device)
+        # greedy decoding
+        for k in range(self.prediction_length):
+            # self.encoder_decoder._check_shapes(repeated_past_target, next_sample, next_features)
+            # sequence = torch.cat((repeated_past_target, next_sample), dim=1)
 
-        feature_samples = torch.zeros((
-            next_samples.size(0), 0, self.input_size + self._number_of_features
-        ), device=encoder_output.device)
-
-        for k in range(1, self.prediction_length):
-            next_feature = torch.cat((
-                repeated_static_feat, repeated_time_feat[:, k: k + 1]
-            ), dim=-1)
-            next_features = torch.cat((next_features, next_feature), dim=1)
-
-            feature_sample = torch.cat((
-                (next_samples[:, k - 1:] - repeated_loc) / repeated_scale, next_features[:, k - 1:]
-            ), dim=-1)
-            feature_samples = torch.cat((
-                feature_samples, feature_sample
-            ), dim=1)
-
-            target_mask = nn.Transformer(). \
-                generate_square_subsequent_mask(feature_samples.size(1)). \
-                to(encoder_output.device)
-            decoder_output = self.decoder(
-                tgt=feature_samples.type(torch.float64),
-                memory=repeated_encoder_output.type(torch.float64),
-                tgt_mask=target_mask.type(torch.float64),
+            lagged_sequence = self.encoder_decoder.get_lagged_subsequences(
+                sequence=repeated_past_target,
+                subsequences_length=1 + k,
+                shift=1,
             )
 
-            next_sample = self.sample(decoder_output[:, -1:], loc=repeated_loc, scale=repeated_scale)
-            next_samples = torch.cat((next_samples, next_sample), dim=1)
+            lags_shape = lagged_sequence.shape
+            reshaped_lagged_sequence = lagged_sequence.reshape(
+                lags_shape[0], lags_shape[1], -1
+            )
 
-        next_samples = next_samples.reshape(
+            decoder_input = torch.cat(
+                (reshaped_lagged_sequence, repeated_features[:, : k + 1]), dim=-1
+            )
+
+            dec_pos = self.encoder_decoder.pos_embedding(
+                decoder_input.size(), past_key_values_length=self.context_length
+            )
+            output = self.encoder_decoder.transformer.decoder(
+                self.encoder_decoder.dec_embedding(decoder_input) + dec_pos, repeated_enc_out
+            )
+
+            # params = self.encoder_decoder.param_proj(output[:, -1:])
+            # distr = self.encoder_decoder.output_distribution(
+            #     params, loc=repeated_loc, scale=repeated_scale
+            # )
+            # next_sample = distr.sample()
+
+            next_sample = self.sample(output[:, -1:], loc=repeated_loc, scale=repeated_scale)
+            
+            repeated_past_target = torch.cat(
+                (repeated_past_target, (next_sample - repeated_loc) / repeated_scale),
+                dim=1,
+            )
+            future_samples.append(next_sample)
+
+        concat_future_samples = torch.cat(future_samples, dim=1)
+        concat_future_samples = concat_future_samples.reshape(
             (-1, num_parallel_samples, self.prediction_length, self.input_size)
-        )
-
-        return next_samples.squeeze(-1)
-
+        ).squeeze(-1)
+#         concat_future_samples = concat_future_samples.reshape(
+#             (-1, num_parallel_samples, self.prediction_length) + self.encoder_decoder.target_shape,
+#         )
+        
+        return concat_future_samples
+    
     def get_loss_values(self, model_output, loc, scale, target, observed_values):
         B, T = model_output.shape[:2]
         # Sample a random timestep for each sample in the batch
@@ -564,7 +376,9 @@ class TransTimeGradModel(nn.Module):
         )
 
         model_output = self.unet(
-            noisy_output.type(torch.float64), timesteps.type(torch.float64), model_output.reshape(B * T, 1, -1).type(torch.float64)
+            noisy_output.type(torch.float64),
+            timesteps.type(torch.float64),
+            model_output.reshape(B * T, 1, -1).type(torch.float64),
         )
         if self.scheduler.config.prediction_type == "epsilon":
             target_noise = noise
@@ -594,7 +408,11 @@ class TransTimeGradModel(nn.Module):
 
         self.scheduler.set_timesteps(self.num_inference_steps)
         for t in self.scheduler.timesteps:
-            model_output = self.unet(sample.type(torch.float64), t.type(torch.float64), context.view(B * T, 1, -1).type(torch.float64))
+            model_output = self.unet(
+                sample.type(torch.float64),
+                t.type(torch.float64),
+                context.view(B * T, 1, -1).type(torch.float64),
+            )
             sample = self.scheduler.step(model_output, t, sample).prev_sample
 
         return (sample.view(B, T, -1) * scale) + loc
@@ -633,7 +451,7 @@ class TransTimeGradModel(nn.Module):
             *future_observed_values.shape[extra_dims + 1:],
         )
 
-        loc, scale, encoder_output, static_feat = self.unroll_lagged_model(
+        transformer_inputs, loc, scale, _ = self.encoder_decoder.create_network_inputs(
             feat_static_cat,
             feat_static_real,
             past_time_feat,
@@ -641,34 +459,45 @@ class TransTimeGradModel(nn.Module):
             past_observed_values,
             future_time_feat,
             future_target_reshaped,
+            # future_target,
         )
-        repeated_static_feat = static_feat.unsqueeze(1).repeat_interleave(self.prediction_length, dim=1)
 
-        next_features = torch.cat((
-            repeated_static_feat, future_time_feat
-        ), dim=-1)
-        feature_samples = torch.cat((
-            (future_target_reshaped - loc) / scale, next_features
-        ), dim=-1)
-        
-        target_mask = nn.Transformer(). \
-            generate_square_subsequent_mask(feature_samples.size(1)). \
-            to(encoder_output.device)
-        decoder_output = self.decoder(
-            tgt=feature_samples.type(torch.float64),
-            memory=encoder_output.type(torch.float64),
-            tgt_mask=target_mask.type(torch.float64),
+        enc_input = self.encoder_decoder.enc_embedding(
+            transformer_inputs[:, : self.context_length, ...]
         )
+        enc_pos = self.encoder_decoder.pos_embedding(enc_input.size())
+        enc_out = self.encoder_decoder.transformer.encoder(enc_input + enc_pos)
+
+        dec_input = self.encoder_decoder.dec_embedding(
+            transformer_inputs[:, self.context_length:, ...]
+        )
+        dec_pos = self.encoder_decoder.pos_embedding(
+            dec_input.size(), past_key_values_length=self.context_length
+        )
+        dec_output = self.encoder_decoder.transformer.decoder(
+            dec_input + dec_pos, enc_out, tgt_mask=self.encoder_decoder.tgt_mask
+        )
+
+        # params = self.encoder_decoder.output_params(transformer_inputs)
+        # distr = self.encoder_decoder.output_distribution(params, loc=loc, scale=scale)
+
+        # observed_values = (
+        #     future_observed_values.all(-1)
+        #     if future_observed_values.ndim == 3
+        #     else future_observed_values
+        # )
+
+        # loss_values = loss(distr, future_target) * observed_values
 
         if future_only:
-            sliced_decoder_output = decoder_output[:, -self.prediction_length:]
+            sliced_dec_output = dec_output[:, -self.prediction_length:]
             observed_values = (
                 future_observed_reshaped.all(-1)
                 if future_observed_reshaped.ndim == 3
                 else future_observed_reshaped
             )
             loss_values = self.get_loss_values(
-                model_output=sliced_decoder_output,
+                model_output=sliced_dec_output,
                 loc=loc,
                 scale=scale,
                 target=future_target_reshaped,
@@ -688,7 +517,7 @@ class TransTimeGradModel(nn.Module):
             )
 
             loss_values = self.get_loss_values(
-                model_output=decoder_output,
+                model_output=dec_output,
                 loc=loc,
                 scale=scale,
                 target=target,
