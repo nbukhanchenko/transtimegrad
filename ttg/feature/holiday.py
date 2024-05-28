@@ -1,9 +1,9 @@
 from typing import Callable, List
 
+from gluonts.time_feature.holiday import distance_to_holiday, indicator
 import numpy as np
 import pandas as pd
 from pandas.tseries.holiday import Holiday
-from gluonts.time_feature.holiday import distance_to_holiday, indicator
 
 
 class CustomDateFeatureSet:
@@ -105,7 +105,9 @@ class CustomHolidayFeatureSet:
         ... )
         >>> import pandas as pd
         >>> from pandas.tseries.holiday import Holiday
-        >>> cfs = CustomHolidayFeatureSet([Holiday("New Years Day", month=1, day=1), Holiday("Christmas Day", month=12, day=25)])
+        >>> cfs = CustomHolidayFeatureSet([
+            Holiday("New Years Day", month=1, day=1), Holiday("Christmas Day", month=12, day=25)
+        ])
         >>> date_indices = pd.date_range(
         ...     start="2016-12-24",
         ...     end="2016-12-31",
@@ -118,7 +120,9 @@ class CustomHolidayFeatureSet:
     Example use for using a squared exponential kernel:
 
         >>> kernel = squared_exponential_kernel(alpha=1.0)
-        >>> sfs = SpecialDateFeatureSet([Holiday("New Years Day", month=1, day=1), Holiday("Christmas Day", month=12, day=25)], kernel)
+        >>> sfs = SpecialDateFeatureSet([
+            Holiday("New Years Day", month=1, day=1), Holiday("Christmas Day", month=12, day=25)
+        ], kernel)
         >>> sfs(date_indices)
         array([[1.00000000e+00, 3.67879441e-01, 1.83156389e-02, 1.23409804e-04,
                 1.12535175e-07, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00],

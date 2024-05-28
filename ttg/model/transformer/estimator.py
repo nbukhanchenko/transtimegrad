@@ -13,7 +13,6 @@
 
 from typing import Any, Dict, Iterable, List, Optional
 
-import torch
 from gluonts.core.component import validated
 from gluonts.dataset.common import Dataset
 from gluonts.dataset.field_names import FieldName
@@ -43,10 +42,10 @@ from gluonts.transform import (
     VstackFeatures,
 )
 from gluonts.transform.sampler import InstanceSampler
-
-from ...modules import StudentTOutput
+import torch
 
 from .lightning_module import TransformerLightningModule
+from ...modules import StudentTOutput
 
 PREDICTION_INPUT_NAMES = [
     "feat_static_cat",

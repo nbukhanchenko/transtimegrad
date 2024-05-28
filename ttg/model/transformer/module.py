@@ -13,18 +13,17 @@
 
 from typing import List, Optional
 
-import numpy as np
-
-import torch
-import torch.nn as nn
-
 from gluonts.core.component import validated
 from gluonts.model import Input, InputSpec
-from gluonts.time_feature import get_lags_for_frequency
 from gluonts.torch.distributions import DistributionOutput, StudentTOutput
 from gluonts.torch.modules.loss import DistributionLoss, NegativeLogLikelihood
 from gluonts.torch.modules.feature import FeatureEmbedder
 from gluonts.torch.scaler import MeanScaler, NOPScaler, Scaler, StdScaler
+import numpy as np
+import torch
+import torch.nn as nn
+
+from ...util import get_lags_for_frequency
 
 
 class ValueEmbedding(nn.Module):
