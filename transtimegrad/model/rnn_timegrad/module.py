@@ -148,7 +148,10 @@ class TimeGradModel(nn.Module):
             batch_first=True,
         )
 
-        self.unet = EpsilonTheta(target_dim=input_size, cond_dim=hidden_size)
+        self.unet = EpsilonTheta(
+            target_dim=input_size, cond_dim=hidden_size,
+            max_steps=scheduler.config.num_train_timesteps,
+        )
         self.scheduler = scheduler
         self.num_inference_steps = num_inference_steps
 
@@ -234,7 +237,7 @@ class TimeGradModel(nn.Module):
         lags = lagged_sequence_values(self.lags_seq, prior_input, input, dim=1)
         time_feat = torch.cat(
             (
-                past_time_feat[:, -self.context_length + 1:, ...],
+                past_time_feat[:, -self.context_length:, ...][:, 1:],
                 future_time_feat,
             ),
             dim=1,
@@ -476,7 +479,8 @@ class TimeGradModel(nn.Module):
             model_output = self.unet(sample, t, context.view(B * T, 1, -1))
             sample = self.scheduler.step(model_output, t, sample).prev_sample
 
-        return (sample.view(B, T, -1) * scale) + loc
+        sample = sample.view(B, T) if self.input_size == 1 else sample.view(B, T, -1)
+        return sample * scale + loc
 
     def loss(
         self,
@@ -537,9 +541,9 @@ class TimeGradModel(nn.Module):
                 observed_values=observed_values,
             )
         else:
-            context_target = past_target[:, -self.context_length + 1:, ...]
+            context_target = past_target[:, -self.context_length:, ...][:, 1:]
             target = torch.cat((context_target, future_target_reshaped), dim=1)
-            context_observed = past_observed_values[:, -self.context_length + 1:, ...]
+            context_observed = past_observed_values[:, -self.context_length:, ...][:, 1:]
             observed_values = torch.cat(
                 (context_observed, future_observed_reshaped), dim=1
             )

@@ -172,7 +172,10 @@ class TransTimeGradModel(nn.Module):
         ).type(torch.float64)
         ########
 
-        self.unet = EpsilonTheta(target_dim=input_size, cond_dim=hidden_size).type(torch.float64)
+        self.unet = EpsilonTheta(
+            target_dim=input_size, cond_dim=hidden_size,
+            max_steps=scheduler.config.num_train_timesteps,
+        ).type(torch.float64)
         self.scheduler = scheduler
         self.num_inference_steps = num_inference_steps
 
@@ -331,7 +334,9 @@ class TransTimeGradModel(nn.Module):
                 decoder_input.size(), past_key_values_length=self.context_length
             )
             output = self.encoder_decoder.transformer.decoder(
-                self.encoder_decoder.dec_embedding(decoder_input) + dec_pos, repeated_enc_out
+                self.encoder_decoder.dec_embedding(decoder_input) + dec_pos,
+                repeated_enc_out,
+                tgt_mask=self.encoder_decoder.tgt_mask[:k + 1, :k + 1],
             )
 
             # params = self.encoder_decoder.param_proj(output[:, -1:])
@@ -415,7 +420,8 @@ class TransTimeGradModel(nn.Module):
             )
             sample = self.scheduler.step(model_output, t, sample).prev_sample
 
-        return (sample.view(B, T, -1) * scale) + loc
+        sample = sample.view(B, T) if self.input_size == 1 else sample.view(B, T, -1)
+        return sample * scale + loc
 
     def loss(
         self,
@@ -430,6 +436,8 @@ class TransTimeGradModel(nn.Module):
         future_only: bool = True,
         aggregate_by=torch.mean,
     ) -> torch.Tensor:
+        # A one-step context has no auxiliary targets.
+        future_only = future_only or self.context_length == 1
         extra_dims = len(future_target.shape) - len(past_target.shape)
         extra_shape = future_target.shape[:extra_dims]
         # batch_shape = future_target.shape[: extra_dims + 1]
@@ -463,31 +471,46 @@ class TransTimeGradModel(nn.Module):
         )
 
         enc_input = self.encoder_decoder.enc_embedding(
-            transformer_inputs[:, : self.context_length, ...]
+            transformer_inputs[:, :self.context_length]
         )
         enc_pos = self.encoder_decoder.pos_embedding(enc_input.size())
-        enc_out = self.encoder_decoder.transformer.encoder(enc_input + enc_pos)
+        enc_mask = None
+        if not future_only:
+            # Context losses must not attend to later context tokens through memory.
+            enc_mask = self.encoder_decoder.transformer.generate_square_subsequent_mask(
+                self.context_length, device=enc_input.device, dtype=enc_input.dtype
+            )
+        enc_out = self.encoder_decoder.transformer.encoder(enc_input + enc_pos, mask=enc_mask)
 
-        dec_input = self.encoder_decoder.dec_embedding(
-            transformer_inputs[:, self.context_length:, ...]
-        )
+        if future_only:
+            decoder_inputs = transformer_inputs[:, self.context_length:]
+            position_offset = self.context_length
+            tgt_mask = self.encoder_decoder.tgt_mask
+            memory_mask = None
+        else:
+            # Teacher force the context and future in one causal decoder pass.
+            # Drop the first context output, just as the RNN loss does.
+            decoder_inputs = transformer_inputs
+            position_offset = 0
+            length = decoder_inputs.shape[1]
+            tgt_mask = self.encoder_decoder.transformer.generate_square_subsequent_mask(
+                length, device=enc_input.device, dtype=enc_input.dtype
+            )
+            query = torch.arange(length, device=enc_input.device)[:, None]
+            key = torch.arange(self.context_length, device=enc_input.device)[None, :]
+            memory_mask = torch.zeros(
+                length, self.context_length, device=enc_input.device, dtype=enc_input.dtype
+            ).masked_fill(key > query, float("-inf"))
+
+        dec_input = self.encoder_decoder.dec_embedding(decoder_inputs)
         dec_pos = self.encoder_decoder.pos_embedding(
-            dec_input.size(), past_key_values_length=self.context_length
+            dec_input.size(), past_key_values_length=position_offset
         )
         dec_output = self.encoder_decoder.transformer.decoder(
-            dec_input + dec_pos, enc_out, tgt_mask=self.encoder_decoder.tgt_mask
+            dec_input + dec_pos, enc_out, tgt_mask=tgt_mask, memory_mask=memory_mask
         )
-
-        # params = self.encoder_decoder.output_params(transformer_inputs)
-        # distr = self.encoder_decoder.output_distribution(params, loc=loc, scale=scale)
-
-        # observed_values = (
-        #     future_observed_values.all(-1)
-        #     if future_observed_values.ndim == 3
-        #     else future_observed_values
-        # )
-
-        # loss_values = loss(distr, future_target) * observed_values
+        if not future_only:
+            dec_output = dec_output[:, 1:]
 
         if future_only:
             sliced_dec_output = dec_output[:, -self.prediction_length:]
@@ -504,9 +527,9 @@ class TransTimeGradModel(nn.Module):
                 observed_values=observed_values,
             )
         else:
-            context_target = past_target[:, -self.context_length + 1:]
+            context_target = past_target[:, -self.context_length:][:, 1:]
             target = torch.cat((context_target, future_target_reshaped), dim=1)
-            context_observed = past_observed_values[:, -self.context_length + 1:]
+            context_observed = past_observed_values[:, -self.context_length:][:, 1:]
             observed_values = torch.cat(
                 (context_observed, future_observed_reshaped), dim=1
             )

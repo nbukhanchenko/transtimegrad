@@ -262,7 +262,7 @@ class TimeGradEstimator(PyTorchLightningEstimator):
                 AsNumpyArray(
                     field=FieldName.TARGET,
                     # in the following line, we add 1 for the time dimension
-                    expected_ndim=2,
+                    expected_ndim=1 if self.input_size == 1 else 2,
                 ),
                 AddObservedValuesIndicator(
                     target_field=FieldName.TARGET,

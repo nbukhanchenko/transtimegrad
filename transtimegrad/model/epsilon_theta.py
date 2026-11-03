@@ -31,7 +31,7 @@ class DiffusionEmbedding(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, hidden_size, residual_channels, dilation):
+    def __init__(self, hidden_size, residual_channels, dilation, padding_mode="circular"):
         super().__init__()
         self.dilated_conv = nn.Conv1d(
             residual_channels,
@@ -43,7 +43,7 @@ class ResidualBlock(nn.Module):
         )
         self.diffusion_projection = nn.Linear(hidden_size, residual_channels)
         self.conditioner_projection = nn.Conv1d(
-            1, 2 * residual_channels, 1, padding=2, padding_mode="circular"
+            1, 2 * residual_channels, 1, padding=2, padding_mode=padding_mode
         )
         self.output_projection = nn.Conv1d(residual_channels, 2 * residual_channels, 1)
 
@@ -69,8 +69,9 @@ class ResidualBlock(nn.Module):
 class CondUpsampler(nn.Module):
     def __init__(self, cond_dim, target_dim):
         super().__init__()
-        self.linear1 = nn.Linear(cond_dim, target_dim // 2)
-        self.linear2 = nn.Linear(target_dim // 2, target_dim)
+        hidden_dim = max(1, target_dim // 2)
+        self.linear1 = nn.Linear(cond_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, target_dim)
 
     def forward(self, x):
         x = self.linear1(x)
@@ -90,13 +91,15 @@ class EpsilonTheta(nn.Module):
         residual_channels=8,
         dilation_cycle_length=2,
         residual_hidden=64,
+        max_steps=500,
     ):
         super().__init__()
+        padding_mode = "replicate" if target_dim == 1 else "circular"
         self.input_projection = nn.Conv1d(
-            1, residual_channels, 1, padding=2, padding_mode="circular"
+            1, residual_channels, 1, padding=2, padding_mode=padding_mode
         )
         self.diffusion_embedding = DiffusionEmbedding(
-            time_emb_dim, proj_dim=residual_hidden
+            time_emb_dim, proj_dim=residual_hidden, max_steps=max_steps
         )
         self.cond_upsampler = CondUpsampler(target_dim=target_dim, cond_dim=cond_dim)
         self.residual_layers = nn.ModuleList(
@@ -105,6 +108,7 @@ class EpsilonTheta(nn.Module):
                     residual_channels=residual_channels,
                     dilation=2 ** (i % dilation_cycle_length),
                     hidden_size=residual_hidden,
+                    padding_mode=padding_mode,
                 )
                 for i in range(residual_layers)
             ]

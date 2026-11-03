@@ -13,7 +13,7 @@
 
 from gluonts.itertools import select
 from gluonts.torch.modules.loss import DistributionLoss, NegativeLogLikelihood
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 

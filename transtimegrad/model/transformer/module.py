@@ -369,7 +369,6 @@ class TransformerModel(nn.Module):
             future_target=future_target,
             future_observed_values=torch.ones_like(future_target),
             loss=NegativeLogLikelihood(),
-            future_only=True,
             aggregate_by=torch.sum,
         )
 
@@ -451,13 +450,13 @@ class TransformerModel(nn.Module):
         enc_out = self.transformer.encoder(self.enc_embedding(encoder_inputs) + enc_pos)
 
         repeated_scale = scale.repeat_interleave(
-            repeats=self.num_parallel_samples, dim=0
+            repeats=num_parallel_samples, dim=0
         )
 
-        repeated_loc = loc.repeat_interleave(repeats=self.num_parallel_samples, dim=0)
+        repeated_loc = loc.repeat_interleave(repeats=num_parallel_samples, dim=0)
 
         repeated_past_target = (
-            past_target.repeat_interleave(repeats=self.num_parallel_samples, dim=0)
+            past_target.repeat_interleave(repeats=num_parallel_samples, dim=0)
             - repeated_loc
         ) / repeated_scale
 
@@ -466,11 +465,11 @@ class TransformerModel(nn.Module):
         )
         features = torch.cat((expanded_static_feat, future_time_feat), dim=-1)
         repeated_features = features.repeat_interleave(
-            repeats=self.num_parallel_samples, dim=0
+            repeats=num_parallel_samples, dim=0
         )
 
         repeated_enc_out = enc_out.repeat_interleave(
-            repeats=self.num_parallel_samples, dim=0
+            repeats=num_parallel_samples, dim=0
         )
 
         future_samples = []
@@ -499,7 +498,8 @@ class TransformerModel(nn.Module):
                 decoder_input.size(), past_key_values_length=self.context_length
             )
             output = self.transformer.decoder(
-                self.dec_embedding(decoder_input) + dec_pos, repeated_enc_out
+                self.dec_embedding(decoder_input) + dec_pos, repeated_enc_out,
+                tgt_mask=self.tgt_mask[:k + 1, :k + 1],
             )
 
             params = self.param_proj(output[:, -1:])
@@ -516,5 +516,5 @@ class TransformerModel(nn.Module):
 
         concat_future_samples = torch.cat(future_samples, dim=1)
         return concat_future_samples.reshape(
-            (-1, self.num_parallel_samples, self.prediction_length) + self.target_shape,
+            (-1, num_parallel_samples, self.prediction_length) + self.target_shape,
         )
