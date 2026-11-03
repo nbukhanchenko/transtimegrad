@@ -11,97 +11,32 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-from gluonts.itertools import select
-from gluonts.torch.modules.loss import DistributionLoss, NegativeLogLikelihood
-import lightning.pytorch as pl
-import torch
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from typing import Optional, Union
 
+from gluonts.core.component import validated
+
+from ...serialization import checkpoint_decode, checkpoint_encode
+from ..loss import DistributionLoss, NegativeLogLikelihood
+from ..rnn_timegrad.lightning_module import TimeGradLightningModule
 from .module import TransformerModel
 
 
-class TransformerLightningModule(pl.LightningModule):
+class TransformerLightningModule(TimeGradLightningModule):
+    """Shared forecasting training loop with a distribution likelihood loss."""
+
+    model_type = TransformerModel
+
+    @validated()
     def __init__(
         self,
         model_kwargs: dict,
-        loss: DistributionLoss = NegativeLogLikelihood(),
+        loss: Optional[Union[DistributionLoss, dict]] = None,
         lr: float = 1e-3,
         weight_decay: float = 1e-8,
         patience: int = 10,
     ) -> None:
-        super().__init__()
-        self.save_hyperparameters()
-        self.model = TransformerModel(**model_kwargs)
-        self.loss = loss
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.patience = patience
-        self.inputs = self.model.describe_inputs()
-        self.example_input_array = self.inputs.zeros()
-
-    def training_step(self, batch, batch_idx: int):  # type: ignore
-        """
-        Execute training step.
-        """
-        train_loss = self.model.loss(
-            **select(self.inputs, batch),
-            future_observed_values=batch["future_observed_values"],
-            future_target=batch["future_target"],
-            loss=self.loss,
-        ).mean()
-
-        self.log(
-            "train_loss",
-            train_loss,
-            on_epoch=True,
-            on_step=False,
-            prog_bar=True,
+        super().__init__(
+            model_kwargs=model_kwargs, lr=lr, weight_decay=weight_decay, patience=patience
         )
-
-        return train_loss
-
-    def validation_step(self, batch, batch_idx: int):  # type: ignore
-        """
-        Execute validation step.
-        """
-        val_loss = self.model.loss(
-            **select(self.inputs, batch),
-            future_observed_values=batch["future_observed_values"],
-            future_target=batch["future_target"],
-            loss=self.loss,
-        ).mean()
-
-        self.log("val_loss", val_loss, on_epoch=True, on_step=False, prog_bar=True)
-
-        return val_loss
-
-    def configure_optimizers(self):
-        """
-        Returns the optimizer to use.
-        """
-        optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-        )
-        monitor = (
-            "val_loss"
-            if self.trainer.fit_loop.epoch_loop.val_loop._data_source.is_defined()
-            else "train_loss"
-        )
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": ReduceLROnPlateau(
-                    optimizer=optimizer,
-                    mode="min",
-                    factor=0.5,
-                    patience=self.patience,
-                ),
-                "monitor": monitor,
-            },
-        }
-
-    def forward(self, *args, **kwargs):
-        return self.model(*args, **kwargs)
+        self.loss = checkpoint_decode(loss) if loss is not None else NegativeLogLikelihood()
+        self.save_hyperparameters({"loss": checkpoint_encode(self.loss)})

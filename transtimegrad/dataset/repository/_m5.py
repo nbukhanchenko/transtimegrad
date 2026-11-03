@@ -1,15 +1,109 @@
-from functools import lru_cache
-import os
+"""Build the M5 validation/evaluation split from the user's local Kaggle CSVs."""
+
 from pathlib import Path
 
-from gluonts.dataset import DatasetWriter
-from gluonts.dataset.common import MetaData, TrainDatasets
-from gluonts.dataset.repository._util import metadata
-from gluonts.time_feature.holiday import squared_exponential_kernel
 import numpy as np
 import pandas as pd
+from gluonts.dataset import DatasetWriter
+from gluonts.dataset.common import (
+    BasicFeatureInfo,
+    CategoricalFeatureInfo,
+    MetaData,
+    TrainDatasets,
+    load_datasets,
+)
+from gluonts.time_feature.holiday import squared_exponential_kernel
 
 from ...feature import CustomDateFeatureSet
+from ...storage import atomic_directory_write
+
+_ID_FIELDS = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+_STATIC_FIELDS = ["state_id", "store_id", "cat_id", "dept_id", "item_id"]
+_DYNAMIC_FIELDS = ["sell_price", "event_1", "event_2", "snap"]
+
+
+def _day_columns(sales):
+    columns = [column for column in sales if column.startswith("d_") and column[2:].isdigit()]
+    columns.sort(key=lambda column: int(column[2:]))
+    if not columns or [int(column[2:]) for column in columns] != list(range(1, len(columns) + 1)):
+        raise ValueError("M5 sales must contain consecutive day columns starting at d_1")
+    return columns
+
+
+def _validate_saved_dataset(path, expected_metadata=None, expected_count=None):
+    """Verify the manifest and stream every stored record before replacement."""
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError("dataset destination must be a regular directory")
+    if {entry.name for entry in path.iterdir()} != {"metadata.json", "train", "test"}:
+        raise ValueError("refusing to overwrite a directory containing unrelated files")
+    metadata = path / "metadata.json"
+    if metadata.is_symlink() or not metadata.is_file():
+        raise ValueError("dataset metadata must be a regular file")
+    for name in ("train", "test"):
+        directory = path / name
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("dataset splits must be regular directories")
+        files = list(directory.iterdir())
+        if (
+            len(files) != 1
+            or files[0].name
+            not in {"data.json", "data.json.gz", "data.arrow", "data.feather", "data.parquet"}
+            or files[0].is_symlink()
+            or not files[0].is_file()
+        ):
+            raise ValueError("dataset split contains unrelated files or symlinks")
+    loaded = load_datasets(path, path / "train", path / "test")
+    if expected_metadata is not None and loaded.metadata != expected_metadata:
+        raise ValueError("saved metadata differs from the generated dataset")
+    identifiers = []
+    for split in (loaded.train, loaded.test):
+        seen = set()
+        for entry in split:
+            identity = entry.get("item_id")
+            target = entry["target"]
+            dynamic = entry.get("feat_dynamic_real")
+            static = entry.get("feat_static_cat")
+            if identity is None or identity in seen:
+                raise ValueError("saved dataset has missing or duplicate series identifiers")
+            if target.ndim != 1 or not target.size or not np.isfinite(target).all():
+                raise ValueError("saved dataset contains invalid target observations")
+            if (
+                dynamic is None
+                or dynamic.shape != (4, len(target))
+                or not np.isfinite(dynamic).all()
+            ):
+                raise ValueError("saved dataset has invalid dynamic features")
+            if (
+                static is None
+                or len(static) != len(loaded.metadata.feat_static_cat)
+                or any(
+                    value < 0 or value >= int(info.cardinality)
+                    for value, info in zip(static, loaded.metadata.feat_static_cat, strict=True)
+                )
+            ):
+                raise ValueError("saved dataset has invalid categorical features")
+            seen.add(identity)
+        if not seen or (expected_count is not None and len(seen) != expected_count):
+            raise ValueError("saved dataset contains an unexpected number of series")
+        identifiers.append(seen)
+    if identifiers[0] != identifiers[1]:
+        raise ValueError("saved training/test series identities differ")
+
+
+def _save_dataset(dataset, destination, writer, expected_count):
+    """Publish a fully read-back dataset using the shared recoverable transaction."""
+
+    def write(stage):
+        # GluonTS creates its output root itself; stage is our new empty directory.
+        stage.rmdir()
+        dataset.save(str(stage), writer=writer, overwrite=False)
+
+    atomic_directory_write(
+        destination,
+        write,
+        _validate_saved_dataset,
+        lambda path: _validate_saved_dataset(path, dataset.metadata, expected_count),
+    )
 
 
 def generate_pts_m5_dataset(
@@ -20,256 +114,141 @@ def generate_pts_m5_dataset(
     prediction_length: int = 28,
     alpha: float = 0.5,
 ):
-    cal_path = f"{m5_file_path}/calendar.csv"
-    sales_path = f"{m5_file_path}/sales_train_validation.csv"
-    sales_test_path = f"{m5_file_path}/sales_train_evaluation.csv"
-    sell_prices_path = f"{m5_file_path}/sell_prices.csv"
+    """Generate aligned train/test series without deleting source or unrelated data.
 
-    if not os.path.exists(cal_path) or not os.path.exists(sales_path):
-        raise RuntimeError(
-            "M5 data is available on Kaggle"
-            " (https://www.kaggle.com/c/m5-forecasting-accuracy/data). You"
-            " first need to agree to the terms of the competition before"
-            " being able to download the data. After you have done that,"
-            f" please supply the files at {m5_file_path}."
-        )
-
-    # Read M5 data from dataset_path
-    calendar = pd.read_csv(cal_path, parse_dates=True)
-    calendar.sort_index(inplace=True)
-    calendar.date = pd.to_datetime(calendar.date)
-
-    sales_train_validation = pd.read_csv(
-        sales_path,
-        index_col=["id", "item_id", "dept_id", "cat_id", "store_id", "state_id"],
-    )
-    sales_train_validation.sort_index(inplace=True)
-
-    sales_train_evaluation = pd.read_csv(
-        sales_test_path,
-        index_col=["id", "item_id", "dept_id", "cat_id", "store_id", "state_id"],
-    )
-    sales_train_evaluation.sort_index(inplace=True)
-
-    sell_prices = pd.read_csv(sell_prices_path, index_col=["item_id", "store_id"])
-    sell_prices.sort_index(inplace=True)
-
-    @lru_cache(maxsize=None)
-    def get_sell_price(item_id, store_id):
-        return calendar.merge(
-            sell_prices.loc[item_id, store_id], on=["wm_yr_wk"], how="left"
-        ).sell_price
-
-    # Build dynamic features
-    kernel = squared_exponential_kernel(alpha=alpha)
-    event_1 = CustomDateFeatureSet(calendar[calendar.event_name_1.notna()].date, kernel)
-    event_2 = CustomDateFeatureSet(calendar[calendar.event_name_2.notna()].date, kernel)
-
-    snap_CA = CustomDateFeatureSet(calendar[calendar.snap_CA == 1].date, kernel)
-    snap_TX = CustomDateFeatureSet(calendar[calendar.snap_TX == 1].date, kernel)
-    snap_WI = CustomDateFeatureSet(calendar[calendar.snap_WI == 1].date, kernel)
-
-    time_index = pd.to_datetime(calendar.date)
-    event_1_feature = event_1(time_index)
-    event_2_feature = event_2(time_index)
-
-    snap_CA_feature = snap_CA(time_index)
-    snap_TX_feature = snap_TX(time_index)
-    snap_WI_feature = snap_WI(time_index)
-
-    # Build static features
-    sales_train_validation["state"] = pd.CategoricalIndex(
-        sales_train_validation.index.get_level_values(5)
-    ).codes
-    sales_train_validation["store"] = pd.CategoricalIndex(
-        sales_train_validation.index.get_level_values(4)
-    ).codes
-    sales_train_validation["cat"] = pd.CategoricalIndex(
-        sales_train_validation.index.get_level_values(3)
-    ).codes
-    sales_train_validation["dept"] = pd.CategoricalIndex(
-        sales_train_validation.index.get_level_values(2)
-    ).codes
-    sales_train_validation["item"] = pd.CategoricalIndex(
-        sales_train_validation.index.get_level_values(1)
-    ).codes
-
-    sales_train_evaluation["state"] = pd.CategoricalIndex(
-        sales_train_evaluation.index.get_level_values(5)
-    ).codes
-    sales_train_evaluation["store"] = pd.CategoricalIndex(
-        sales_train_evaluation.index.get_level_values(4)
-    ).codes
-    sales_train_evaluation["cat"] = pd.CategoricalIndex(
-        sales_train_evaluation.index.get_level_values(3)
-    ).codes
-    sales_train_evaluation["dept"] = pd.CategoricalIndex(
-        sales_train_evaluation.index.get_level_values(2)
-    ).codes
-    sales_train_evaluation["item"] = pd.CategoricalIndex(
-        sales_train_evaluation.index.get_level_values(1)
-    ).codes
-
-    # feat_static_cat = [
-    #     {
-    #         "name": "state_id",
-    #         "cardinality": sales_train_validation["state"].nunique(),
-    #     },
-    #     {
-    #         "name": "store_id",
-    #         "cardinality": sales_train_validation["store"].nunique(),
-    #     },
-    #     {
-    #         "name": "cat_id",
-    #         "cardinality": sales_train_validation["cat"].nunique(),
-    #     },
-    #     {
-    #         "name": "dept_id",
-    #         "cardinality": sales_train_validation["dept"].nunique(),
-    #     },
-    #     {
-    #         "name": "item_id",
-    #         "cardinality": sales_train_validation["item"].nunique(),
-    #     },
-    # ]
-    cardinalities = [
-        sales_train_validation["state"].nunique(),
-        sales_train_validation["store"].nunique(),
-        sales_train_validation["cat"].nunique(),
-        sales_train_validation["dept"].nunique(),
-        sales_train_validation["item"].nunique(),
+    Leading zero sales are trimmed using the training split only; all-zero series
+    retain their complete history. Missing historical prices are forward filled,
+    with zero before the first known price, so future prices do not leak backwards.
+    """
+    source = Path(m5_file_path).resolve()
+    destination = Path(dataset_path).absolute()
+    if source == destination.resolve() or destination.resolve() in source.parents:
+        raise ValueError("dataset destination must not contain the source CSV directory")
+    filenames = [
+        "calendar.csv",
+        "sales_train_validation.csv",
+        "sales_train_evaluation.csv",
+        "sell_prices.csv",
     ]
-
-    # feat_dynamic_real = [
-    #     {"name": "sell_price", "cardinality": 1},
-    #     {"name": "event_1", "cardinality": 1},
-    #     {"name": "event_2", "cardinality": 1},
-    #     {"name": "snap", "cardinality": 1},
-    # ]
-
-    # Build training set
-    # train_file = dataset_path / "train" / "data.json"
-    train_ds = []
-    for index, item in sales_train_validation.iterrows():
-        id, item_id, dept_id, cat_id, store_id, state_id = index
-        start_index = np.nonzero(item.iloc[:1913].values)[0][0]
-        start_date = time_index[start_index]
-        time_series = {}
-
-        state_enc, store_enc, cat_enc, dept_enc, item_enc = item.iloc[1913:]
-
-        time_series["start"] = str(start_date)
-        time_series["item_id"] = id[:-11]
-
-        time_series["feat_static_cat"] = [
-            state_enc,
-            store_enc,
-            cat_enc,
-            dept_enc,
-            item_enc,
-        ]
-
-        sell_price = get_sell_price(item_id, store_id)
-        snap_feature = {
-            "CA": snap_CA_feature,
-            "TX": snap_TX_feature,
-            "WI": snap_WI_feature,
-        }[state_id]
-
-        time_series["target"] = (
-            item.iloc[start_index:1913].values.astype(np.float32).tolist()
+    missing = [name for name in filenames if not (source / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            "M5 data must be downloaded from Kaggle after accepting its terms; "
+            f"missing local files at {source}: {', '.join(missing)}"
         )
-        time_series["feat_dynamic_real"] = (
-            np.concatenate(
-                (
-                    np.expand_dims(sell_price.iloc[start_index:1913].values, 0),
-                    event_1_feature[:, start_index:1913],
-                    event_2_feature[:, start_index:1913],
-                    snap_feature[:, start_index:1913],
-                ),
-                0,
-            )
-            .astype(np.float32)
-            .tolist()
+    if prediction_length < 1 or not np.isfinite(alpha) or alpha < 0:
+        raise ValueError("prediction_length must be positive and alpha must be nonnegative")
+    if pd.tseries.frequencies.to_offset(pandas_freq) != pd.tseries.offsets.Day():
+        raise ValueError("M5 observations have daily frequency")
+
+    calendar = pd.read_csv(source / filenames[0])
+    calendar["date"] = pd.to_datetime(calendar["date"])
+    if calendar["d"].duplicated().any():
+        raise ValueError("calendar has duplicate day identifiers")
+    calendar = calendar.set_index("d")
+    train = pd.read_csv(source / filenames[1]).set_index(_ID_FIELDS).sort_index()
+    test = pd.read_csv(source / filenames[2]).set_index(_ID_FIELDS).sort_index()
+    if train.empty or train.index.to_frame(index=False).isna().any().any():
+        raise ValueError("M5 training data must contain nonempty, identified series")
+    if (
+        train.index.has_duplicates
+        or test.index.has_duplicates
+        or not train.index.equals(test.index)
+    ):
+        raise ValueError("M5 training and evaluation series identities must match uniquely")
+    train_days, test_days = _day_columns(train), _day_columns(test)
+    if len(train_days) < prediction_length:
+        raise ValueError("training data is shorter than prediction_length")
+    if (
+        test_days[: len(train_days)] != train_days
+        or len(test_days) - len(train_days) < prediction_length
+    ):
+        raise ValueError(
+            "evaluation data must extend training data by at least prediction_length days"
         )
+    if not set(test_days) <= set(calendar.index):
+        raise ValueError("calendar does not cover the sales observations")
+    calendar = calendar.loc[test_days]
+    if (
+        not calendar["date"]
+        .reset_index(drop=True)
+        .equals(pd.Series(pd.date_range(calendar["date"].iloc[0], periods=len(calendar), freq="D")))
+    ):
+        raise ValueError("calendar sales dates must be consecutive daily observations")
+    if not np.array_equal(train[train_days].to_numpy(), test[train_days].to_numpy()):
+        raise ValueError("evaluation history differs from training history")
+    for sales, days in ((train, train_days), (test, test_days)):
+        values = sales[days].to_numpy(dtype=float)
+        if not np.isfinite(values).all() or (values < 0).any():
+            raise ValueError("M5 sales must be finite and nonnegative")
 
-        train_ds.append(time_series.copy())
-
-    # # Build training set
-    # train_file = dataset_path / "train" / "data.json"
-    # save_to_file(train_file, train_ds)
-
-    # # Create metadata file
-    # meta_file = dataset_path / "metadata.json"
-    # with open(meta_file, "w") as f:
-    #     f.write(
-    #         json.dumps(
-    #             {
-    #                 "freq": pandas_freq,
-    #                 "prediction_length": prediction_length,
-    #                 "feat_static_cat": feat_static_cat,
-    #                 "feat_dynamic_real": feat_dynamic_real,
-    #                 "cardinality": len(train_ds),
-    #             }
-    #         )
-    #     )
+    prices = pd.read_csv(source / filenames[3])
+    if prices.duplicated(["item_id", "store_id", "wm_yr_wk"]).any():
+        raise ValueError("sell_prices has duplicate item/store/week entries")
+    if not np.isfinite(prices["sell_price"]).all() or (prices["sell_price"] < 0).any():
+        raise ValueError("sell prices must be finite and nonnegative")
+    price_groups = {
+        key: group.set_index("wm_yr_wk")["sell_price"]
+        for key, group in prices.groupby(["item_id", "store_id"])
+    }
+    kernel = squared_exponential_kernel(alpha=alpha)
+    event_features = [
+        CustomDateFeatureSet(calendar.loc[calendar[name].notna(), "date"], kernel)(calendar["date"])
+        for name in ("event_name_1", "event_name_2")
+    ]
+    snap_features = {
+        state: CustomDateFeatureSet(calendar.loc[calendar[f"snap_{state}"] == 1, "date"], kernel)(
+            calendar["date"]
+        )
+        for state in ("CA", "TX", "WI")
+    }
+    categories = {
+        name: {
+            value: code
+            for code, value in enumerate(sorted(train.index.get_level_values(name).unique()))
+        }
+        for name in _STATIC_FIELDS
+    }
     meta = MetaData(
-        **metadata(
-            cardinality=cardinalities,
-            freq=pandas_freq,
-            prediction_length=prediction_length,
-        )
+        freq=pandas_freq,
+        prediction_length=prediction_length,
+        feat_static_cat=[
+            CategoricalFeatureInfo(name=name, cardinality=str(len(categories[name])))
+            for name in _STATIC_FIELDS
+        ],
+        feat_dynamic_real=[BasicFeatureInfo(name=name) for name in _DYNAMIC_FIELDS],
     )
-    meta.feat_dynamic_real = ["sell_price", "event_1", "event_2", "snap"]
 
-    # Build testing set
-    # test_file = dataset_path / "test" / "data.json"
-    test_ds = []
-    for index, item in sales_train_evaluation.iterrows():
-        id, item_id, dept_id, cat_id, store_id, state_id = index
-        start_index = np.nonzero(item.iloc[:1941].values)[0][0]
-        start_date = time_index[start_index]
-        time_series = {}
-
-        state_enc, store_enc, cat_enc, dept_enc, item_enc = item.iloc[1941:]
-
-        time_series["start"] = str(start_date)
-        time_series["item_id"] = id[:-11]
-
-        time_series["feat_static_cat"] = [
-            state_enc,
-            store_enc,
-            cat_enc,
-            dept_enc,
-            item_enc,
-        ]
-
-        sell_price = get_sell_price(item_id, store_id)
-        snap_feature = {
-            "CA": snap_CA_feature,
-            "TX": snap_TX_feature,
-            "WI": snap_WI_feature,
-        }[state_id]
-
-        time_series["target"] = (
-            item.iloc[start_index:1941].values.astype(np.float32).tolist()
-        )
-        time_series["feat_dynamic_real"] = (
-            np.concatenate(
-                (
-                    np.expand_dims(sell_price.iloc[start_index:1941].values, 0),
-                    event_1_feature[:, start_index:1941],
-                    event_2_feature[:, start_index:1941],
-                    snap_feature[:, start_index:1941],
-                ),
-                0,
+    def entries(sales, days):
+        # Stream entries: materializing both full M5 splits as Python lists costs
+        # many gigabytes beyond the input tables themselves.
+        for identity, row in sales.iterrows():
+            fields = dict(zip(_ID_FIELDS, identity, strict=True))
+            training_values = train.loc[identity, train_days].to_numpy(dtype=np.float32)
+            nonzero = np.flatnonzero(training_values)
+            start = (
+                min(int(nonzero[0]), max(0, len(train_days) - prediction_length))
+                if len(nonzero)
+                else 0
             )
-            .astype(np.float32)
-            .tolist()
-        )
+            state = fields["state_id"]
+            if state not in snap_features:
+                raise ValueError(f"unknown M5 state: {state}")
+            price = price_groups.get(
+                (fields["item_id"], fields["store_id"]), pd.Series(dtype=float)
+            )
+            price = calendar["wm_yr_wk"].map(price).ffill().fillna(0).to_numpy(dtype=np.float32)
+            dynamic = np.concatenate((price[None], *event_features, snap_features[state]), axis=0)
+            static = [categories[name][fields[name]] for name in _STATIC_FIELDS]
+            yield {
+                "start": str(calendar["date"].iloc[start]),
+                "item_id": f"{fields['item_id']}_{fields['store_id']}",
+                "feat_static_cat": static,
+                "target": row[days].to_numpy(dtype=np.float32)[start:].tolist(),
+                "feat_dynamic_real": dynamic[:, start : len(days)].astype(np.float32).tolist(),
+            }
 
-        test_ds.append(time_series.copy())
-
-    # save_to_file(test_file, test_ds)
-    dataset = TrainDatasets(metadata=meta, train=train_ds, test=test_ds)
-    dataset.save(path_str=str(dataset_path), writer=dataset_writer, overwrite=True)
+    dataset = TrainDatasets(
+        metadata=meta, train=entries(train, train_days), test=entries(test, test_days)
+    )
+    _save_dataset(dataset, destination, dataset_writer, expected_count=len(train))

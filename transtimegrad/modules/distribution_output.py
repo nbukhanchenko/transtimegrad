@@ -1,12 +1,12 @@
-from typing import Dict, Optional, Tuple
-import warnings
+"""Network projections and immutable forecast distributions."""
 
+import warnings
+from typing import Dict, Optional, Tuple
+
+import torch
 from gluonts.core.component import validated
 from gluonts.torch.distributions import AffineTransformed, DistributionOutput
 from gluonts.torch.distributions.studentT import StudentT
-
-import numpy as np
-import torch
 from torch.distributions import (
     Beta,
     Categorical,
@@ -18,64 +18,64 @@ from torch.distributions import (
     NegativeBinomial,
     Normal,
     Poisson,
+    constraints,
 )
 
 from ..distributions import ZeroInflatedNegativeBinomial, ZeroInflatedPoisson
 
 
+def squareplus(x):
+    """Positive map without cancellation at large negative inputs or x**2 overflow."""
+    radius = torch.hypot(x, torch.full_like(x, 2))
+    denominator = (radius / 2 - x / 2).clamp_min(torch.finfo(x.dtype).tiny)
+    return torch.where(x >= 0, x / 2 + radius / 2, denominator.reciprocal()).clamp_min(
+        torch.finfo(x.dtype).tiny
+    )
+
+
+def _count_scale(loc, scale):
+    # Counts must remain integer valued; use the established mean/rate scaling.
+    if loc is not None and torch.any(torch.as_tensor(loc) != 0):
+        raise ValueError("count outputs do not support centering; use mean/no scaling")
+    if scale is not None:
+        value = torch.as_tensor(scale)
+        if not torch.isfinite(value).all() or (value <= 0).any():
+            raise ValueError("count scale must be finite and positive")
+    return scale
+
+
 class IndependentDistributionOutput(DistributionOutput):
     @validated()
     def __init__(self, dim: Optional[int] = None) -> None:
+        if dim is not None and dim < 1:
+            raise ValueError("dim must be positive")
         self.dim = dim
+        if dim is not None:
+            self.args_dim = {key: dim for key in self.args_dim}
 
     @property
     def event_shape(self) -> Tuple:
-        if self.dim is None:
-            return ()
-        else:
-            return (self.dim,)
+        return () if self.dim is None else (self.dim,)
+
+    def _event_arg(self, value):
+        return value.squeeze(-1) if self.dim is None else value
 
     def independent(self, distr: Distribution) -> Distribution:
-        if self.dim is None:
-            return distr
+        return distr if self.dim is None else Independent(distr, 1)
 
-        return Independent(distr, 1)
-
-    def distribution(
-        self,
-        distr_args,
-        loc: Optional[torch.Tensor] = None,
-        scale: Optional[torch.Tensor] = None,
-    ) -> Distribution:
+    def distribution(self, distr_args, loc=None, scale=None) -> Distribution:
         distr = self.independent(self.distr_cls(*distr_args))
-        if scale is None:
-            scale = 1.0
-        if loc is None:
-            loc = 0.0
         return AffineTransformed(distr, loc=loc, scale=scale)
 
-    @staticmethod
-    def squareplus(x: torch.Tensor) -> torch.Tensor:
-        r"""
-        Helper to map inputs to the positive orthant by applying the square-plus operation. Reference:
-        https://twitter.com/jon_barron/status/1387167648669048833
-        """
-        return (x + torch.sqrt(torch.square(x) + 4.0)) / 2.0
+    squareplus = staticmethod(squareplus)
 
 
 class NormalOutput(IndependentDistributionOutput):
     args_dim: Dict[str, int] = {"loc": 1, "scale": 1}
-    distr_cls: type = Normal
+    distr_cls = Normal
 
-    def __init__(self, dim: Optional[int] = None) -> None:
-        super().__init__(dim)
-        if dim is not None:
-            self.args_dim = {k: dim for k in self.args_dim}
-
-    @classmethod
-    def domain_map(cls, loc, scale):
-        scale = cls.squareplus(scale)
-        return loc.squeeze(-1), scale.squeeze(-1)
+    def domain_map(self, loc, scale):
+        return self._event_arg(loc), self._event_arg(squareplus(scale))
 
 
 class IndependentNormalOutput(NormalOutput):
@@ -85,181 +85,125 @@ class IndependentNormalOutput(NormalOutput):
         warnings.warn(
             "IndependentNormalOutput is deprecated. Use NormalOutput instead.",
             DeprecationWarning,
+            stacklevel=2,
         )
 
 
 class BetaOutput(IndependentDistributionOutput):
-    args_dim: Dict[str, int] = {"concentration1": 1, "concentration0": 1}
-    distr_cls: type = Beta
+    args_dim = {"concentration1": 1, "concentration0": 1}
+    distr_cls = Beta
 
-    def __init__(self, dim: Optional[int] = None) -> None:
-        super().__init__(dim)
-        if dim is not None:
-            self.args_dim = {k: dim for k in self.args_dim}
+    def domain_map(self, concentration1, concentration0):
+        return self._event_arg(squareplus(concentration1)), self._event_arg(
+            squareplus(concentration0)
+        )
 
-    @classmethod
-    def domain_map(cls, concentration1, concentration0):
-        concentration1 = cls.squareplus(concentration1) + 1e-8
-        concentration0 = cls.squareplus(concentration0) + 1e-8
-        return concentration1.squeeze(-1), concentration0.squeeze(-1)
+    @property
+    def value_in_support(self):
+        return 0.5
 
 
 class PoissonOutput(IndependentDistributionOutput):
-    args_dim: Dict[str, int] = {"rate": 1}
-    distr_cls: type = Poisson
+    args_dim = {"rate": 1}
+    distr_cls = Poisson
 
-    def __init__(self, dim: Optional[int] = None) -> None:
-        super().__init__(dim)
-        if dim is not None:
-            self.args_dim = {k: dim for k in self.args_dim}
+    def domain_map(self, rate):
+        return (self._event_arg(squareplus(rate)),)
 
-    @classmethod
-    def domain_map(cls, rate):
-        rate_pos = cls.squareplus(rate).clone()
-
-        return (rate_pos.squeeze(-1),)
-
-    def distribution(
-        self,
-        distr_args,
-        loc: Optional[torch.Tensor] = None,
-        scale: Optional[torch.Tensor] = None,
-    ) -> Distribution:
+    def distribution(self, distr_args, loc=None, scale=None):
+        scale = _count_scale(loc, scale)
         (rate,) = distr_args
-
-        if scale is not None:
-            rate *= scale
-
-        if loc is not None:
-            rate += loc
-
-        return self.independent(Poisson(rate))
+        return self.independent(Poisson(rate if scale is None else rate * scale))
 
 
 class ZeroInflatedPoissonOutput(IndependentDistributionOutput):
-    args_dim: Dict[str, int] = {"gate": 1, "rate": 1}
-    distr_cls: type = ZeroInflatedPoisson
+    args_dim = {"gate": 1, "rate": 1}
+    distr_cls = ZeroInflatedPoisson
 
-    def __init__(self, dim: Optional[int] = None) -> None:
-        super().__init__(dim)
-        if dim is not None:
-            self.args_dim = {k: dim for k in self.args_dim}
+    def domain_map(self, gate, rate):
+        return self._event_arg(gate.sigmoid()), self._event_arg(squareplus(rate))
 
-    @classmethod
-    def domain_map(cls, gate, rate):
-        gate_unit = torch.sigmoid(gate).clone()
-        rate_pos = cls.squareplus(rate).clone()
-
-        return gate_unit.squeeze(-1), rate_pos.squeeze(-1)
-
-    def distribution(
-        self,
-        distr_args,
-        loc: Optional[torch.Tensor] = None,
-        scale: Optional[torch.Tensor] = None,
-    ) -> Distribution:
+    def distribution(self, distr_args, loc=None, scale=None):
+        scale = _count_scale(loc, scale)
         gate, rate = distr_args
-
-        if scale is not None:
-            rate *= scale
-
-        if loc is not None:
-            rate += loc
-
-        return self.independent(ZeroInflatedPoisson(gate=gate, rate=rate))
+        return self.independent(ZeroInflatedPoisson(gate, rate if scale is None else rate * scale))
 
 
 class NegativeBinomialOutput(IndependentDistributionOutput):
-    args_dim: Dict[str, int] = {"total_count": 1, "logits": 1}
-    distr_cls: type = NegativeBinomial
+    args_dim = {"total_count": 1, "logits": 1}
+    distr_cls = NegativeBinomial
 
-    def __init__(self, dim: Optional[int] = None) -> None:
-        super().__init__(dim)
-        if dim is not None:
-            self.args_dim = {k: dim for k in self.args_dim}
+    def domain_map(self, total_count, logits):
+        return self._event_arg(squareplus(total_count)), self._event_arg(logits)
 
-    @classmethod
-    def domain_map(cls, total_count, logits):
-        total_count = cls.squareplus(total_count)
-        return total_count.squeeze(-1), logits.squeeze(-1)
-
-    def distribution(
-        self,
-        distr_args,
-        loc: Optional[torch.Tensor] = None,
-        scale: Optional[torch.Tensor] = None,
-    ) -> Distribution:
+    def distribution(self, distr_args, loc=None, scale=None):
+        scale = _count_scale(loc, scale)
         total_count, logits = distr_args
-
         if scale is not None:
-            logits += scale.log()
-
-        # shift negative binomial parameters by loc
-        if loc is not None:
-            total_count += loc
-
-        return self.independent(
-            NegativeBinomial(total_count=total_count, logits=logits)
-        )
+            logits = logits + torch.as_tensor(scale, device=logits.device, dtype=logits.dtype).log()
+        return self.independent(NegativeBinomial(total_count=total_count, logits=logits))
 
 
 class ZeroInflatedNegativeBinomialOutput(IndependentDistributionOutput):
-    args_dim: Dict[str, int] = {"gate": 1, "total_count": 1, "logits": 1}
-    distr_cls: type = ZeroInflatedNegativeBinomial
+    args_dim = {"gate": 1, "total_count": 1, "logits": 1}
+    distr_cls = ZeroInflatedNegativeBinomial
 
-    def __init__(self, dim: Optional[int] = None) -> None:
-        super().__init__(dim)
-        if dim is not None:
-            self.args_dim = {k: dim for k in self.args_dim}
-
-    @classmethod
-    def domain_map(cls, gate, total_count, logits):
-        gate = torch.sigmoid(gate)
-        total_count = cls.squareplus(total_count)
-        return gate.squeeze(-1), total_count.squeeze(-1), logits.squeeze(-1)
-
-    def distribution(
-        self,
-        distr_args,
-        loc: Optional[torch.Tensor] = None,
-        scale: Optional[torch.Tensor] = None,
-    ) -> Distribution:
-        gate, total_count, logits = distr_args
-
-        if scale is not None:
-            logits += scale.log()
-
-        # shift negative binomial parameters by loc
-        if loc is not None:
-            total_count += loc
-
-        return self.independent(
-            ZeroInflatedNegativeBinomial(
-                gate=gate, total_count=total_count, logits=logits
-            )
+    def domain_map(self, gate, total_count, logits):
+        return (
+            self._event_arg(gate.sigmoid()),
+            self._event_arg(squareplus(total_count)),
+            self._event_arg(logits),
         )
+
+    def distribution(self, distr_args, loc=None, scale=None):
+        scale = _count_scale(loc, scale)
+        gate, total_count, logits = distr_args
+        if scale is not None:
+            logits = logits + torch.as_tensor(scale, device=logits.device, dtype=logits.dtype).log()
+        return self.independent(ZeroInflatedNegativeBinomial(gate, total_count, logits=logits))
 
 
 class StudentTOutput(IndependentDistributionOutput):
-    args_dim: Dict[str, int] = {"df": 1, "loc": 1, "scale": 1}
-    distr_cls: type = StudentT
+    args_dim = {"df": 1, "loc": 1, "scale": 1}
+    distr_cls = StudentT
 
-    def __init__(self, dim: Optional[int] = None) -> None:
-        super().__init__(dim)
-        if dim is not None:
-            self.args_dim = {k: dim for k in self.args_dim}
-
-    @classmethod
-    def domain_map(cls, df, loc, scale):
-        scale = cls.squareplus(scale)
-        df = 2.0 + cls.squareplus(df)
-        return df.squeeze(-1), loc.squeeze(-1), scale.squeeze(-1)
+    def domain_map(self, df, loc, scale):
+        return (
+            self._event_arg(2 + squareplus(df)),
+            self._event_arg(loc),
+            self._event_arg(squareplus(scale)),
+        )
 
 
-class StudentTMixtureOutput(DistributionOutput):
+class NormalMixtureOutput(DistributionOutput):
     @validated()
     def __init__(self, components: int = 1) -> None:
+        if components < 1:
+            raise ValueError("components must be positive")
         self.components = components
+        self.args_dim = {"mix_logits": components, "loc": components, "scale": components}
+
+    squareplus = staticmethod(squareplus)
+
+    @classmethod
+    def domain_map(cls, mix_logits, loc, scale):
+        # The component axis is required even for a single component.
+        return mix_logits, loc, squareplus(scale)
+
+    def distribution(self, distr_args, loc=None, scale=None):
+        mix_logits, dist_loc, dist_scale = distr_args
+        distr = MixtureSameFamily(Categorical(logits=mix_logits), Normal(dist_loc, dist_scale))
+        return AffineTransformed(distr, loc=loc, scale=scale)
+
+    @property
+    def event_shape(self):
+        return ()
+
+
+class StudentTMixtureOutput(NormalMixtureOutput):
+    @validated()
+    def __init__(self, components: int = 1) -> None:
+        super().__init__(components)
         self.args_dim = {
             "mix_logits": components,
             "df": components,
@@ -267,236 +211,177 @@ class StudentTMixtureOutput(DistributionOutput):
             "scale": components,
         }
 
-    @staticmethod
-    def squareplus(x: torch.Tensor) -> torch.Tensor:
-        r"""
-        Helper to map inputs to the positive orthant by applying the square-plus operation. Reference:
-        https://twitter.com/jon_barron/status/1387167648669048833
-        """
-        return (x + torch.sqrt(torch.square(x) + 4.0)) / 2.0
-
     @classmethod
     def domain_map(cls, mix_logits, df, loc, scale):
-        scale = cls.squareplus(scale)
-        df = 2.0 + cls.squareplus(df)
-        return (
-            mix_logits.squeeze(-1),
-            df.squeeze(-1),
-            loc.squeeze(-1),
-            scale.squeeze(-1),
-        )
+        return mix_logits, 2 + squareplus(df), loc, squareplus(scale)
 
-    def distribution(
-        self,
-        distr_args,
-        loc: Optional[torch.Tensor] = None,
-        scale: Optional[torch.Tensor] = None,
-    ) -> Distribution:
+    def distribution(self, distr_args, loc=None, scale=None):
         mix_logits, df, dist_loc, dist_scale = distr_args
-
         distr = MixtureSameFamily(
             Categorical(logits=mix_logits), StudentT(df, dist_loc, dist_scale)
         )
-        if scale is None:
-            scale = 1.0
-        if loc is None:
-            loc = 0.0
         return AffineTransformed(distr, loc=loc, scale=scale)
-
-    @property
-    def event_shape(self) -> Tuple:
-        return ()
-
-
-class NormalMixtureOutput(DistributionOutput):
-    @validated()
-    def __init__(self, components: int = 1) -> None:
-        self.components = components
-        self.args_dim = {
-            "mix_logits": components,
-            "loc": components,
-            "scale": components,
-        }
-
-    @staticmethod
-    def squareplus(x: torch.Tensor) -> torch.Tensor:
-        r"""
-        Helper to map inputs to the positive orthant by applying the square-plus operation. Reference:
-        https://twitter.com/jon_barron/status/1387167648669048833
-        """
-        return (x + torch.sqrt(torch.square(x) + 4.0)) / 2.0
-
-    @classmethod
-    def domain_map(cls, mix_logits, loc, scale):
-        scale = cls.squareplus(scale)
-        return mix_logits.squeeze(-1), loc.squeeze(-1), scale.squeeze(-1)
-
-    def distribution(
-        self,
-        distr_args,
-        loc: Optional[torch.Tensor] = None,
-        scale: Optional[torch.Tensor] = None,
-    ) -> Distribution:
-        mix_logits, dist_loc, dist_scale = distr_args
-
-        distr = MixtureSameFamily(
-            Categorical(logits=mix_logits), Normal(dist_loc, dist_scale)
-        )
-        if scale is None:
-            scale = 1.0
-        if loc is None:
-            loc = 0.0
-        return AffineTransformed(distr, loc=loc, scale=scale)
-
-    @property
-    def event_shape(self) -> Tuple:
-        return ()
 
 
 class LowRankMultivariateNormalOutput(DistributionOutput):
     @validated()
     def __init__(
-        self,
-        dim: int,
-        rank: int,
-        sigma_init: float = 1.0,
-        sigma_minimum: float = 1e-3,
+        self, dim: int, rank: int, sigma_init: float = 1.0, sigma_minimum: float = 1e-3
     ) -> None:
+        if dim < 1 or rank < 1 or rank > dim or sigma_init <= 0 or sigma_minimum < 0:
+            raise ValueError("require dim >= rank >= 1, sigma_init > 0 and sigma_minimum >= 0")
         self.distr_cls = LowRankMultivariateNormal
-        self.dim = dim
-        self.rank = rank
-        self.sigma_init = sigma_init
-        self.sigma_minimum = sigma_minimum
+        self.dim, self.rank = dim, rank
+        self.sigma_init, self.sigma_minimum = sigma_init, sigma_minimum
         self.args_dim = {"loc": dim, "cov_factor": dim * rank, "cov_diag": dim}
 
     def domain_map(self, loc, cov_factor, cov_diag):
-        diag_bias = (
-            self.inv_softplus(self.sigma_init**2) if self.sigma_init > 0.0 else 0.0
-        )
+        variance = self.sigma_init**2
+        diag_bias = variance - 1 / variance  # inverse of squareplus
+        factor = cov_factor.reshape(cov_factor.shape[:-1] + (self.dim, self.rank))
+        return loc, factor, squareplus(cov_diag + diag_bias) + self.sigma_minimum**2
 
-        shape = cov_factor.shape[:-1] + (self.dim, self.rank)
-        cov_factor = cov_factor.reshape(shape)
-        cov_diag = self.squareplus(cov_diag + diag_bias) + self.sigma_minimum**2
-
-        return loc, cov_factor, cov_diag
-
-    @staticmethod
-    def squareplus(x: torch.Tensor) -> torch.Tensor:
-        r"""
-        Helper to map inputs to the positive orthant by applying the square-plus operation. Reference:
-        https://twitter.com/jon_barron/status/1387167648669048833
-        """
-        return (x + torch.sqrt(torch.square(x) + 4.0)) / 2.0
+    squareplus = staticmethod(squareplus)
 
     @staticmethod
     def inv_softplus(y):
-        if y < 20.0:
-            return np.log(np.exp(y) - 1.0)
-        else:
-            return y
+        # Retained for callers of the old helper; the covariance map uses squareplus.
+        import math
+
+        return y + math.log(-math.expm1(-y))
 
     @property
-    def event_shape(self) -> Tuple:
+    def event_shape(self):
         return (self.dim,)
 
 
 class MultivariateNormalOutput(DistributionOutput):
     @validated()
     def __init__(self, dim: int) -> None:
-        self.args_dim = {"loc": dim, "scale_tril": dim * dim}
+        if dim < 1:
+            raise ValueError("dim must be positive")
         self.dim = dim
+        self.args_dim = {"loc": dim, "scale_tril": dim * dim}
 
-    @staticmethod
-    def squareplus(x: torch.Tensor) -> torch.Tensor:
-        r"""
-        Helper to map inputs to the positive orthant by applying the square-plus operation. Reference:
-        https://twitter.com/jon_barron/status/1387167648669048833
-        """
-        return (x + torch.sqrt(torch.square(x) + 4.0)) / 2.0
+    squareplus = staticmethod(squareplus)
 
     def domain_map(self, loc, scale):
-        d = self.dim
-        device = scale.device
+        matrix = scale.reshape(scale.shape[:-1] + (self.dim, self.dim))
+        diagonal = squareplus(matrix.diagonal(dim1=-2, dim2=-1))
+        return loc, matrix.tril(-1) + torch.diag_embed(diagonal)
 
-        shape = scale.shape[:-1] + (d, d)
-        scale = scale.reshape(shape)
-
-        scale_diag = self.squareplus(scale * torch.eye(d, device=device)) * torch.eye(
-            d, device=device
+    def distribution(self, distr_args, loc=None, scale=None):
+        dist_loc, scale_tril = distr_args
+        return AffineTransformed(
+            MultivariateNormal(dist_loc, scale_tril=scale_tril), loc=loc, scale=scale
         )
 
-        mask = torch.tril(torch.ones_like(scale), diagonal=-1)
-        scale_tril = (scale * mask) + scale_diag
-
-        return loc, scale_tril
-
-    def distribution(
-        self,
-        distr_args,
-        loc: Optional[torch.Tensor] = None,
-        scale: Optional[torch.Tensor] = None,
-    ) -> Distribution:
-        dist_loc, scale_tri = distr_args
-        distr = MultivariateNormal(loc=dist_loc, scale_tril=scale_tri)
-
-        if scale is None:
-            scale = 1.0
-        if loc is None:
-            loc = 0.0
-        return AffineTransformed(distr, loc=loc, scale=scale)
-
     @property
-    def event_shape(self) -> Tuple:
+    def event_shape(self):
         return (self.dim,)
 
 
-class FlowOutput(DistributionOutput):
+def _bound_parameters(cond, loc, scale, dim):
+    cond = cond.clone()
+    loc = torch.as_tensor(0 if loc is None else loc, device=cond.device, dtype=cond.dtype).clone()
+    scale = torch.as_tensor(
+        1 if scale is None else scale, device=cond.device, dtype=cond.dtype
+    ).clone()
+    if not torch.isfinite(loc).all() or not torch.isfinite(scale).all() or (scale == 0).any():
+        raise ValueError("loc must be finite and scale finite and nonzero")
+    shape = torch.broadcast_shapes(cond.shape[:-1] + (dim,), loc.shape, scale.shape)
+    if shape[-1] != dim:
+        raise ValueError("loc/scale do not match the event dimension")
+    return cond, loc, scale, shape[:-1]
+
+
+class _ConditionalFlowDistribution(Distribution):
+    """A flow density with independent, captured conditioning and affine parameters."""
+
+    arg_constraints = {}
+    support = constraints.real_vector
+
+    def __init__(self, flow, cond, loc, scale, dim):
+        self.flow = flow
+        self.cond, self.loc, self.scale, batch = _bound_parameters(cond, loc, scale, dim)
+        super().__init__(batch_shape=batch, event_shape=(dim,))
+
+    def log_prob(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        value = torch.broadcast_tensors(
+            value, self.loc, self.scale, self.cond.new_zeros(self.batch_shape + self.event_shape)
+        )[0]
+        normalized = (value - self.loc) / self.scale
+        cond = self.cond.expand(value.shape[:-1] + (self.cond.shape[-1],))
+        latent, jacobian = self.flow.net(normalized, cond)
+        return (self.flow.base_dist.log_prob(latent) + jacobian - self.scale.abs().log()).sum(-1)
+
+    @torch.no_grad()
+    def sample(self, sample_shape=torch.Size()):
+        shape = torch.Size(sample_shape) + self.batch_shape
+        latent = self.flow.base_dist.sample(shape)
+        cond = self.cond.expand(shape + (self.cond.shape[-1],))
+        value, _ = self.flow.net.inverse(latent, cond)
+        return value * self.scale + self.loc
+
+
+class FlowOutput(DistributionOutput, torch.nn.Module):
     @validated()
     def __init__(self, flow, input_size, cond_size):
+        torch.nn.Module.__init__(self)
+        if input_size < 1 or cond_size < 1:
+            raise ValueError("input_size and cond_size must be positive")
+        if getattr(flow, "input_size", input_size) != input_size:
+            raise ValueError("input_size must match the flow/diffusion event dimension")
         self.args_dim = {"cond": cond_size}
-        self.flow = flow
-        self.dim = input_size
+        self.flow, self.dim = flow, input_size
 
     @classmethod
     def domain_map(cls, cond):
         return (cond,)
 
     def distribution(self, distr_args, loc=None, scale=None):
-        (cond,) = distr_args
-        if scale is not None:
-            self.flow.scale = scale
-        if loc is not None:
-            self.flow.loc = loc
-        self.flow.cond = cond
-
-        return self.flow
+        return _ConditionalFlowDistribution(self.flow, distr_args[0], loc, scale, self.dim)
 
     @property
-    def event_shape(self) -> Tuple:
+    def event_shape(self):
         return (self.dim,)
 
 
-class DiffusionOutput(DistributionOutput):
+class _ConditionalDiffusionForecast:
+    """Bound diffusion sampler and denoising loss, deliberately not a probability density."""
+
+    def __init__(self, diffusion, cond, loc, scale, dim):
+        self.diffusion = diffusion
+        self.cond, self.loc, self.scale, self.batch_shape = _bound_parameters(cond, loc, scale, dim)
+        self.event_shape = torch.Size((dim,))
+
+    def sample(self, sample_shape=torch.Size()):
+        cond = self.cond.expand(self.batch_shape + (self.cond.shape[-1],))
+        return self.diffusion.sample(sample_shape, cond=cond, loc=self.loc, scale=self.scale)
+
+    def loss(self, value, **kwargs):
+        return self.diffusion.denoising_loss(
+            value, cond=self.cond, loc=self.loc, scale=self.scale, **kwargs
+        )
+
+    def log_prob(self, value):
+        raise NotImplementedError(
+            "diffusion has no exact log_prob; use .loss(value) for denoising training"
+        )
+
+
+class DiffusionOutput(FlowOutput):
+    """Legacy output adapter. Its forecast offers .sample() and .loss(), not exact log_prob."""
+
     @validated()
     def __init__(self, diffusion, input_size, cond_size):
-        self.args_dim = {"cond": cond_size}
-        self.diffusion = diffusion
-        self.dim = input_size
-
-    @classmethod
-    def domain_map(cls, cond):
-        return (cond,)
-
-    def distribution(self, distr_args, loc=None, scale=None):
-        (cond,) = distr_args
-        if scale is not None:
-            self.diffusion.scale = scale
-        if loc is not None:
-            self.diffusion.loc = loc
-        self.diffusion.cond = cond
-
-        return self.diffusion
+        super().__init__(diffusion, input_size, cond_size)
 
     @property
-    def event_shape(self) -> Tuple:
-        return (self.dim,)
+    def diffusion(self):
+        return self.flow
+
+    def distribution(self, distr_args, loc=None, scale=None):
+        return _ConditionalDiffusionForecast(self.diffusion, distr_args[0], loc, scale, self.dim)

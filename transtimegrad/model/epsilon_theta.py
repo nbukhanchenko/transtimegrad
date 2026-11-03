@@ -1,16 +1,14 @@
 import math
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 
 class DiffusionEmbedding(nn.Module):
     def __init__(self, dim, proj_dim, max_steps=500):
         super().__init__()
-        self.register_buffer(
-            "embedding", self._build_embedding(dim, max_steps), persistent=False
-        )
+        self.register_buffer("embedding", self._build_embedding(dim, max_steps), persistent=False)
         self.projection1 = nn.Linear(dim * 2, proj_dim)
         self.projection2 = nn.Linear(proj_dim, proj_dim)
 

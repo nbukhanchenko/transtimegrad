@@ -4,75 +4,72 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from gluonts.core.component import validated
 from torch.distributions import Normal
 
 
-def create_masks(
-    input_size, hidden_size, n_hidden, input_order="sequential", input_degrees=None
-):
-    # MADE paper sec 4:
-    # degrees of connections between layers -- ensure at most in_degree - 1 connections
-    degrees = []
-
-    # set input degrees to what is provided in args (the flipped order of the previous layer in a stack of mades);
-    # else init input degrees based on strategy in input_order (sequential or random)
-    if input_order == "sequential":
-        degrees += (
-            [torch.arange(input_size)] if input_degrees is None else [input_degrees]
+def create_masks(input_size, hidden_size, n_hidden, input_order="sequential", input_degrees=None):
+    """Build masks whose output coordinate depends only on lower input ranks."""
+    if input_size < 1 or hidden_size < 1 or n_hidden < 0:
+        raise ValueError("input_size/hidden_size must be positive and n_hidden nonnegative")
+    if input_order not in ("sequential", "random"):
+        raise ValueError("input_order must be 'sequential' or 'random'")
+    if input_degrees is None:
+        input_degrees = (
+            torch.arange(input_size) if input_order == "sequential" else torch.randperm(input_size)
         )
-        for _ in range(n_hidden + 1):
-            degrees += [torch.arange(hidden_size) % (input_size - 1)]
-        degrees += (
-            [torch.arange(input_size) % input_size - 1]
-            if input_degrees is None
-            else [input_degrees % input_size - 1]
-        )
-
-    elif input_order == "random":
-        degrees += (
-            [torch.randperm(input_size)] if input_degrees is None else [input_degrees]
-        )
-        for _ in range(n_hidden + 1):
-            min_prev_degree = min(degrees[-1].min().item(), input_size - 1)
-            degrees += [torch.randint(min_prev_degree, input_size, (hidden_size,))]
-        min_prev_degree = min(degrees[-1].min().item(), input_size - 1)
-        degrees += (
-            [torch.randint(min_prev_degree, input_size, (input_size,)) - 1]
-            if input_degrees is None
-            else [input_degrees - 1]
-        )
-
-    # construct masks
-    masks = []
-    for d0, d1 in zip(degrees[:-1], degrees[1:]):
-        masks += [(d1.unsqueeze(-1) >= d0.unsqueeze(0)).float()]
-
-    return masks, degrees[0]
+    input_degrees = torch.as_tensor(input_degrees, dtype=torch.long)
+    if input_degrees.shape != (input_size,) or not torch.equal(
+        input_degrees.sort().values, torch.arange(input_size)
+    ):
+        raise ValueError("input_degrees must be a permutation of 0..input_size-1")
+    degrees = [input_degrees]
+    for _ in range(n_hidden + 1):
+        if input_order == "sequential":
+            hidden_degrees = torch.arange(hidden_size) % input_size - 1
+        else:
+            hidden_degrees = torch.randint(-1, input_size - 1, (hidden_size,))
+            hidden_degrees[0] = -1
+        degrees.append(hidden_degrees)
+    # The -1 hidden rank carries conditioning without depending on any input.
+    degrees.append(input_degrees - 1)
+    masks = [
+        (out.unsqueeze(-1) >= inp.unsqueeze(0)).float()
+        for inp, out in zip(degrees[:-1], degrees[1:], strict=True)
+    ]
+    return masks, input_degrees
 
 
 class FlowSequential(nn.Sequential):
     """Container for layers of a normalizing flow"""
 
     def forward(self, x, y):
-        sum_log_abs_det_jacobians = 0
+        sum_log_abs_det_jacobians = torch.zeros_like(x)
         for module in self:
             x, log_abs_det_jacobian = module(x, y)
-            sum_log_abs_det_jacobians += log_abs_det_jacobian
+            sum_log_abs_det_jacobians = sum_log_abs_det_jacobians + log_abs_det_jacobian
         return x, sum_log_abs_det_jacobians
 
     def inverse(self, u, y):
-        sum_log_abs_det_jacobians = 0
+        sum_log_abs_det_jacobians = torch.zeros_like(u)
         for module in reversed(self):
             u, log_abs_det_jacobian = module.inverse(u, y)
-            sum_log_abs_det_jacobians += log_abs_det_jacobian
+            sum_log_abs_det_jacobians = sum_log_abs_det_jacobians + log_abs_det_jacobian
         return u, sum_log_abs_det_jacobians
 
 
 class BatchNorm(nn.Module):
-    """RealNVP BatchNorm layer"""
+    """Affine flow normalization with running statistics.
+
+    Training transforms use the previous frozen running statistics. The current
+    batch updates only the state used by subsequent forwards. A paired inverse
+    uses the exact affine state captured by the latest training forward.
+    """
 
     def __init__(self, input_size, momentum=0.9, eps=1e-5):
         super().__init__()
+        if input_size < 1 or not 0 <= momentum <= 1 or eps <= 0:
+            raise ValueError("require input_size > 0, momentum in [0,1] and eps > 0")
         self.momentum = momentum
         self.eps = eps
 
@@ -81,26 +78,21 @@ class BatchNorm(nn.Module):
 
         self.register_buffer("running_mean", torch.zeros(input_size))
         self.register_buffer("running_var", torch.ones(input_size))
+        self.register_buffer("batch_mean", None, persistent=False)
+        self.register_buffer("batch_var", None, persistent=False)
 
     def forward(self, x, cond_y=None):
         if self.training:
-            self.batch_mean = x.view(-1, x.shape[-1]).mean(0)
-            # note MAF paper uses biased variance estimate; ie x.var(0, unbiased=False)
-            self.batch_var = x.view(-1, x.shape[-1]).var(0)
-
-            # update running mean
-            self.running_mean.mul_(self.momentum).add_(
-                self.batch_mean.data * (1 - self.momentum)
-            )
-            self.running_var.mul_(self.momentum).add_(
-                self.batch_var.data * (1 - self.momentum)
-            )
-
-            mean = self.batch_mean
-            var = self.batch_var
+            self.batch_mean = self.running_mean.detach().clone()
+            self.batch_var = self.running_var.detach().clone()
+            flat = x.reshape(-1, x.shape[-1])
+            if flat.shape[0] > 1:
+                with torch.no_grad():
+                    self.running_mean.lerp_(flat.mean(0).detach(), 1 - self.momentum)
+                    self.running_var.lerp_(flat.var(0, unbiased=False).detach(), 1 - self.momentum)
+            mean, var = self.batch_mean, self.batch_var
         else:
-            mean = self.running_mean
-            var = self.running_var
+            mean, var = self.running_mean, self.running_var
 
         # compute normalized input (cf original batch norm paper algo 1)
         x_hat = (x - mean) / torch.sqrt(var + self.eps)
@@ -108,17 +100,13 @@ class BatchNorm(nn.Module):
 
         # compute log_abs_det_jacobian (cf RealNVP paper)
         log_abs_det_jacobian = self.log_gamma - 0.5 * torch.log(var + self.eps)
-        #        print('in sum log var {:6.3f} ; out sum log var {:6.3f}; sum log det {:8.3f}; mean log_gamma {:5.3f}; mean beta {:5.3f}'.format(
-        #            (var + self.eps).log().sum().data.numpy(), y.var(0).log().sum().data.numpy(), log_abs_det_jacobian.mean(0).item(), self.log_gamma.mean(), self.beta.mean()))
         return y, log_abs_det_jacobian.expand_as(x)
 
     def inverse(self, y, cond_y=None):
-        if self.training:
-            mean = self.batch_mean
-            var = self.batch_var
+        if self.training and self.batch_mean is not None:
+            mean, var = self.batch_mean, self.batch_var
         else:
-            mean = self.running_mean
-            var = self.running_var
+            mean, var = self.running_mean, self.running_var
 
         x_hat = (y - self.beta) * torch.exp(-self.log_gamma)
         x = x_hat * torch.sqrt(var + self.eps) + mean
@@ -161,19 +149,13 @@ class LinearMaskedCoupling(nn.Module):
 
         # run through model
         s = self.s_net(mx if y is None else torch.cat([y, mx], dim=-1))
-        t = self.t_net(mx if y is None else torch.cat([y, mx], dim=-1)) * (
-            1 - self.mask
-        )
+        t = self.t_net(mx if y is None else torch.cat([y, mx], dim=-1)) * (1 - self.mask)
 
         # cf RealNVP eq 8 where u corresponds to x (here we're modeling u)
         log_s = torch.tanh(s) * (1 - self.mask)
         u = x * torch.exp(log_s) + t
-        # u = (x - t) * torch.exp(log_s)
-        # u = mx + (1 - self.mask) * (x - t) * torch.exp(-s)
 
         # log det du/dx; cf RealNVP 8 and 6; note, sum over input_size done at model log_prob
-        # log_abs_det_jacobian = -(1 - self.mask) * s
-        # log_abs_det_jacobian = -log_s #.sum(-1, keepdim=True)
         log_abs_det_jacobian = log_s
 
         return u, log_abs_det_jacobian
@@ -184,17 +166,11 @@ class LinearMaskedCoupling(nn.Module):
 
         # run through model
         s = self.s_net(mu if y is None else torch.cat([y, mu], dim=-1))
-        t = self.t_net(mu if y is None else torch.cat([y, mu], dim=-1)) * (
-            1 - self.mask
-        )
+        t = self.t_net(mu if y is None else torch.cat([y, mu], dim=-1)) * (1 - self.mask)
 
         log_s = torch.tanh(s) * (1 - self.mask)
         x = (u - t) * torch.exp(-log_s)
-        # x = u * torch.exp(log_s) + t
-        # x = mu + (1 - self.mask) * (u * s.exp() + t)  # cf RealNVP eq 7
 
-        # log_abs_det_jacobian = (1 - self.mask) * s  # log det dx/du
-        # log_abs_det_jacobian = log_s #.sum(-1, keepdim=True)
         log_abs_det_jacobian = -log_s
 
         return x, log_abs_det_jacobian
@@ -248,9 +224,11 @@ class MADE(nn.Module):
         self.register_buffer("base_dist_var", torch.ones(input_size))
 
         # create masks
-        masks, self.input_degrees = create_masks(
+        masks, input_degrees = create_masks(
             input_size, hidden_size, n_hidden, input_order, input_degrees
         )
+
+        self.register_buffer("input_degrees", input_degrees)
 
         # setup activation
         if activation == "ReLU":
@@ -261,9 +239,7 @@ class MADE(nn.Module):
             raise ValueError("Check activation function.")
 
         # construct model
-        self.net_input = MaskedLinear(
-            input_size, hidden_size, masks[0], cond_label_size
-        )
+        self.net_input = MaskedLinear(input_size, hidden_size, masks[0], cond_label_size)
         self.net = []
         for m in masks[1:-1]:
             self.net += [activation_fn, MaskedLinear(hidden_size, hidden_size, m)]
@@ -287,12 +263,12 @@ class MADE(nn.Module):
 
     def inverse(self, u, y=None, sum_log_abs_det_jacobians=None):
         # MAF eq 3
-        # D = u.shape[-1]
         x = torch.zeros_like(u)
         # run through reverse model
-        for i in self.input_degrees:
+        for i in self.input_degrees.argsort():
             m, loga = self.net(self.net_input(x, y)).chunk(chunks=2, dim=-1)
-            x[..., i] = u[..., i] * torch.exp(loga[..., i]) + m[..., i]
+            candidate = u * torch.exp(loga) + m
+            x = torch.where(torch.arange(x.shape[-1], device=x.device) == i, candidate, x)
         log_abs_det_jacobian = loga
         return x, log_abs_det_jacobian
 
@@ -304,7 +280,11 @@ class MADE(nn.Module):
 class Flow(nn.Module):
     def __init__(self, input_size):
         super().__init__()
-        self.__scale = None
+        if input_size < 1:
+            raise ValueError("input_size must be positive")
+        self.input_size = input_size
+        self.register_buffer("_scale", None, persistent=False)
+        self.register_buffer("_loc", None, persistent=False)
         self.net = None
 
         # base distribution for calculation of log prob under the model
@@ -317,13 +297,38 @@ class Flow(nn.Module):
 
     @property
     def scale(self):
-        return self.__scale
+        return self._scale
 
     @scale.setter
     def scale(self, scale):
-        self.__scale = scale
+        if scale is not None:
+            value = torch.as_tensor(
+                scale, device=self.base_dist_mean.device, dtype=self.base_dist_mean.dtype
+            )
+            if not torch.isfinite(value).all() or (value == 0).any():
+                raise ValueError("flow scale must be finite and nonzero")
+        self._scale = None if scale is None else value
 
-    def forward(self, x, cond):
+    @property
+    def loc(self):
+        return self._loc
+
+    @loc.setter
+    def loc(self, loc):
+        value = (
+            None
+            if loc is None
+            else torch.as_tensor(
+                loc, device=self.base_dist_mean.device, dtype=self.base_dist_mean.dtype
+            )
+        )
+        if value is not None and not torch.isfinite(value).all():
+            raise ValueError("flow loc must be finite")
+        self._loc = value
+
+    def forward(self, x, cond=None):
+        if self.loc is not None:
+            x = x - self.loc
         if self.scale is not None:
             x = x / self.scale
         u, log_abs_det_jacobian = self.net(x, cond)
@@ -331,22 +336,25 @@ class Flow(nn.Module):
             log_abs_det_jacobian = log_abs_det_jacobian - torch.log(torch.abs(self.scale))
         return u, log_abs_det_jacobian
 
-    def inverse(self, u, cond):
+    def inverse(self, u, cond=None):
         x, log_abs_det_jacobian = self.net.inverse(u, cond)
         if self.scale is not None:
             x = x * self.scale
             log_abs_det_jacobian = log_abs_det_jacobian + torch.log(torch.abs(self.scale))
+        if self.loc is not None:
+            x = x + self.loc
         return x, log_abs_det_jacobian
 
-    def log_prob(self, x, cond):
+    def log_prob(self, x, cond=None):
         u, sum_log_abs_det_jacobians = self.forward(x, cond)
         return torch.sum(self.base_dist.log_prob(u) + sum_log_abs_det_jacobians, dim=-1)
 
+    @torch.no_grad()
     def sample(self, sample_shape=torch.Size(), cond=None):
+        shape = torch.Size(sample_shape)
         if cond is not None:
-            shape = cond.shape[:-1]
-        else:
-            shape = sample_shape
+            shape = shape + cond.shape[:-1]
+            cond = cond.expand(shape + (cond.shape[-1],))
 
         u = self.base_dist.sample(shape)
         sample, _ = self.inverse(u, cond)
@@ -354,6 +362,7 @@ class Flow(nn.Module):
 
 
 class RealNVP(Flow):
+    @validated()
     def __init__(
         self,
         n_blocks,
@@ -364,15 +373,20 @@ class RealNVP(Flow):
         batch_norm=True,
     ):
         super().__init__(input_size)
+        if (
+            n_blocks < 1
+            or hidden_size < 1
+            or n_hidden < 0
+            or (cond_label_size is not None and cond_label_size < 1)
+        ):
+            raise ValueError("require positive block/hidden/conditioning sizes and n_hidden >= 0")
 
         # construct model
         modules = []
         mask = torch.arange(input_size).float() % 2
-        for i in range(n_blocks):
+        for _ in range(n_blocks):
             modules += [
-                LinearMaskedCoupling(
-                    input_size, hidden_size, n_hidden, mask, cond_label_size
-                )
+                LinearMaskedCoupling(input_size, hidden_size, n_hidden, mask, cond_label_size)
             ]
             mask = 1 - mask
             modules += batch_norm * [BatchNorm(input_size)]
@@ -381,6 +395,7 @@ class RealNVP(Flow):
 
 
 class MAF(Flow):
+    @validated()
     def __init__(
         self,
         n_blocks,
@@ -393,11 +408,18 @@ class MAF(Flow):
         batch_norm=True,
     ):
         super().__init__(input_size)
+        if (
+            n_blocks < 1
+            or hidden_size < 1
+            or n_hidden < 0
+            or (cond_label_size is not None and cond_label_size < 1)
+        ):
+            raise ValueError("require positive block/hidden/conditioning sizes and n_hidden >= 0")
 
         # construct model
         modules = []
         self.input_degrees = None
-        for i in range(n_blocks):
+        for _ in range(n_blocks):
             modules += [
                 MADE(
                     input_size,

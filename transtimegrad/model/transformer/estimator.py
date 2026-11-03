@@ -13,6 +13,7 @@
 
 from typing import Any, Dict, Iterable, List, Optional
 
+import torch
 from gluonts.core.component import validated
 from gluonts.dataset.common import Dataset
 from gluonts.dataset.field_names import FieldName
@@ -22,8 +23,6 @@ from gluonts.itertools import Cyclic
 from gluonts.time_feature import TimeFeature, time_features_from_frequency_str
 from gluonts.torch.distributions import DistributionOutput
 from gluonts.torch.model.estimator import PyTorchLightningEstimator
-from gluonts.torch.model.predictor import PyTorchPredictor
-from gluonts.torch.modules.loss import DistributionLoss, NegativeLogLikelihood
 from gluonts.transform import (
     AddAgeFeature,
     AddObservedValuesIndicator,
@@ -42,10 +41,11 @@ from gluonts.transform import (
     VstackFeatures,
 )
 from gluonts.transform.sampler import InstanceSampler
-import torch
 
-from .lightning_module import TransformerLightningModule
 from ...modules import StudentTOutput
+from ...serialization import TransTimeGradPredictor
+from ..loss import DistributionLoss, NegativeLogLikelihood
+from .lightning_module import TransformerLightningModule
 
 PREDICTION_INPUT_NAMES = [
     "feat_static_cat",
@@ -82,13 +82,13 @@ class TransformerEstimator(PyTorchLightningEstimator):
         lags_seq: Optional[List[int]] = None,
         time_features: Optional[List[TimeFeature]] = None,
         scaling: Optional[str] = "mean",
-        default_scale: float = 0.0,
+        default_scale: Optional[float] = None,
         num_feat_dynamic_real: int = 0,
         num_feat_static_cat: int = 0,
         num_feat_static_real: int = 0,
         cardinality: Optional[List[int]] = None,
         embedding_dimension: Optional[List[int]] = None,
-        distr_output: DistributionOutput = StudentTOutput(),
+        distr_output: Optional[DistributionOutput] = None,
         loss: DistributionLoss = NegativeLogLikelihood(),
         num_parallel_samples: int = 100,
         batch_size: int = 32,
@@ -110,10 +110,12 @@ class TransformerEstimator(PyTorchLightningEstimator):
         self.input_size = input_size
         self.freq = freq
         self.prediction_length = prediction_length
-        self.context_length = (
-            context_length if context_length is not None else prediction_length
+        self.context_length = context_length if context_length is not None else prediction_length
+        self.distr_output = (
+            distr_output
+            if distr_output is not None
+            else (StudentTOutput(dim=input_size) if input_size > 1 else StudentTOutput())
         )
-        self.distr_output = distr_output
         self.loss = loss
         self.lr = lr
         self.weight_decay = weight_decay
@@ -122,9 +124,7 @@ class TransformerEstimator(PyTorchLightningEstimator):
         self.num_feat_dynamic_real = num_feat_dynamic_real
         self.num_feat_static_cat = num_feat_static_cat
         self.num_feat_static_real = num_feat_static_real
-        self.cardinality = (
-            cardinality if cardinality and num_feat_static_cat > 0 else [1]
-        )
+        self.cardinality = cardinality if cardinality and num_feat_static_cat > 0 else [1]
         self.embedding_dimension = embedding_dimension
         self.lags_seq = lags_seq
 
@@ -226,18 +226,15 @@ class TransformerEstimator(PyTorchLightningEstimator):
                 VstackFeatures(
                     output_field=FieldName.FEAT_TIME,
                     input_fields=[FieldName.FEAT_TIME, FieldName.FEAT_AGE]
-                    + (
-                        [FieldName.FEAT_DYNAMIC_REAL]
-                        if self.num_feat_dynamic_real > 0
-                        else []
-                    ),
+                    + ([FieldName.FEAT_DYNAMIC_REAL] if self.num_feat_dynamic_real > 0 else []),
                 ),
                 AsNumpyArray(FieldName.FEAT_TIME, expected_ndim=2),
             ]
         )
 
     def _create_instance_splitter(self, module: TransformerLightningModule, mode: str):
-        assert mode in ["training", "validation", "test"]
+        if mode not in {"training", "validation", "test"}:
+            raise ValueError("mode must be training, validation, or test")
 
         instance_sampler = {
             "training": self.train_sampler,
@@ -268,9 +265,7 @@ class TransformerEstimator(PyTorchLightningEstimator):
         **kwargs,
     ) -> Iterable:
         data = Cyclic(data).stream()
-        instances = self._create_instance_splitter(module, "training").apply(
-            data, is_train=True
-        )
+        instances = self._create_instance_splitter(module, "training").apply(data, is_train=True)
         return as_stacked_batches(
             instances,
             batch_size=self.batch_size,
@@ -286,9 +281,7 @@ class TransformerEstimator(PyTorchLightningEstimator):
         module: TransformerLightningModule,
         **kwargs,
     ) -> Iterable:
-        instances = self._create_instance_splitter(module, "validation").apply(
-            data, is_train=True
-        )
+        instances = self._create_instance_splitter(module, "validation").apply(data, is_train=True)
         return as_stacked_batches(
             instances,
             batch_size=self.batch_size,
@@ -307,9 +300,7 @@ class TransformerEstimator(PyTorchLightningEstimator):
                 "context_length": self.context_length,
                 "prediction_length": self.prediction_length,
                 "input_size": self.input_size,
-                "num_feat_dynamic_real": (
-                    1 + self.num_feat_dynamic_real + len(self.time_features)
-                ),
+                "num_feat_dynamic_real": (1 + self.num_feat_dynamic_real + len(self.time_features)),
                 "num_feat_static_real": max(1, self.num_feat_static_real),
                 "num_feat_static_cat": max(1, self.num_feat_static_cat),
                 "cardinality": self.cardinality,
@@ -333,10 +324,10 @@ class TransformerEstimator(PyTorchLightningEstimator):
         self,
         transformation: Transformation,
         module: TransformerLightningModule,
-    ) -> PyTorchPredictor:
+    ) -> TransTimeGradPredictor:
         prediction_splitter = self._create_instance_splitter(module, "test")
 
-        return PyTorchPredictor(
+        return TransTimeGradPredictor(
             input_transform=transformation + prediction_splitter,
             input_names=PREDICTION_INPUT_NAMES,
             prediction_net=module,

@@ -11,12 +11,13 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
+import torch
 from gluonts.core.component import validated
 from gluonts.itertools import select
 from lightning import LightningModule
-import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
+from ...serialization import checkpoint_decode, checkpoint_encode
 from .module import TimeGradModel
 
 
@@ -40,6 +41,8 @@ class TimeGradLightningModule(LightningModule):
         Patience parameter for learning rate scheduler, default: ``10``.
     """
 
+    model_type = TimeGradModel
+
     @validated()
     def __init__(
         self,
@@ -49,8 +52,17 @@ class TimeGradLightningModule(LightningModule):
         patience: int = 10,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters()
-        self.model = TimeGradModel(**model_kwargs)
+        model_kwargs = checkpoint_decode(model_kwargs)
+        self.save_hyperparameters(
+            {
+                "model_kwargs": checkpoint_encode(model_kwargs),
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "patience": patience,
+            }
+        )
+        self.model = self.model_type(**model_kwargs)
+        self.loss = None
         self.lr = lr
         self.weight_decay = weight_decay
         self.patience = patience
@@ -68,6 +80,7 @@ class TimeGradLightningModule(LightningModule):
             **select(self.inputs, batch),
             future_observed_values=batch["future_observed_values"],
             future_target=batch["future_target"],
+            **({"loss": self.loss} if self.loss is not None else {}),
         ).mean()
 
         self.log(
@@ -88,7 +101,7 @@ class TimeGradLightningModule(LightningModule):
             **select(self.inputs, batch),
             future_observed_values=batch["future_observed_values"],
             future_target=batch["future_target"],
-            future_only=True,
+            **({"loss": self.loss} if self.loss is not None else {}),
         ).mean()
 
         self.log("val_loss", val_loss, on_epoch=True, on_step=False, prog_bar=True)
@@ -104,10 +117,13 @@ class TimeGradLightningModule(LightningModule):
             lr=self.lr,
             weight_decay=self.weight_decay,
         )
-        monitor = (
-            "val_loss"
-            if self.trainer.fit_loop.epoch_loop.val_loop._data_source.is_defined()
-            else "train_loss"
+        monitor = next(
+            (
+                callback.monitor
+                for callback in self.trainer.checkpoint_callbacks
+                if callback.monitor
+            ),
+            "train_loss",
         )
 
         return {

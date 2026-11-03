@@ -12,20 +12,33 @@ from transtimegrad.modules import StudentTOutput
 
 def make_model(kind, dim=2, context=3, horizon=3, timesteps=10):
     kwargs = dict(
-        freq="D", context_length=context, prediction_length=horizon,
-        input_size=dim, lags_seq=[1, 2], num_parallel_samples=3,
+        freq="D",
+        context_length=context,
+        prediction_length=horizon,
+        input_size=dim,
+        lags_seq=[1, 2],
+        num_parallel_samples=3,
     )
     if kind == "transformer":
         model = TransformerModel(
-            **kwargs, d_model=8, nhead=2, num_encoder_layers=2,
-            num_decoder_layers=2, dim_feedforward=16, dropout=0,
+            **kwargs,
+            d_model=8,
+            nhead=2,
+            num_encoder_layers=2,
+            num_decoder_layers=2,
+            dim_feedforward=16,
+            dropout=0,
             distr_output=StudentTOutput(dim=dim) if dim > 1 else StudentTOutput(),
         )
     else:
         cls = TransTimeGradModel if kind == "trans" else TimeGradModel
         model = cls(
-            **kwargs, scheduler=DEISMultistepScheduler(num_train_timesteps=timesteps),
-            hidden_size=8, num_layers=2, dropout_rate=0, num_inference_steps=2,
+            **kwargs,
+            scheduler=DEISMultistepScheduler(num_train_timesteps=timesteps),
+            hidden_size=8,
+            num_layers=2,
+            dropout_rate=0,
+            num_inference_steps=2,
         )
     return model.eval()
 
@@ -40,7 +53,8 @@ def make_batch(model, batch_size=2):
         feat_static_cat=torch.zeros(batch_size, 1, dtype=torch.long),
         feat_static_real=torch.zeros(batch_size, 1),
         past_time_feat=torch.randn(batch_size, model._past_length, 1),
-        past_target=torch.randn(shape), past_observed_values=torch.ones(shape),
+        past_target=torch.randn(shape),
+        past_observed_values=torch.ones(shape),
         future_time_feat=torch.randn(batch_size, model.prediction_length, 1),
         future_target=torch.randn(future_shape),
         future_observed_values=torch.ones(future_shape),
@@ -51,8 +65,10 @@ def prediction_batch(batch):
     return {k: v for k, v in batch.items() if k not in ("future_target", "future_observed_values")}
 
 
-@pytest.mark.parametrize("kind", ["trans", "transformer"])
-def test_teacher_forcing_matches_autoregressive_conditioning(kind, monkeypatch):
+@pytest.mark.parametrize(
+    "kind,future_only", [("trans", True), ("trans", False), ("transformer", True)]
+)
+def test_teacher_forcing_matches_autoregressive_conditioning(kind, future_only, monkeypatch):
     torch.manual_seed(17)
     model = make_model(kind)
     batch = make_batch(model)
@@ -62,13 +78,14 @@ def test_teacher_forcing_matches_autoregressive_conditioning(kind, monkeypatch):
         lambda module, args, output: outputs.append(output.detach().clone())
     )
     with torch.no_grad():
-        model.loss(**batch)
-        teacher_output = outputs.pop()
+        model.loss(**batch, **({"future_only": future_only} if kind == "trans" else {}))
+        teacher_output = outputs[0]
+        outputs.clear()
         step = 0
 
         def known_sample(*args, **kwargs):
             nonlocal step
-            result = batch["future_target"][:, step:step + 1]
+            result = batch["future_target"][:, step : step + 1]
             step += 1
             return result
 
@@ -126,7 +143,7 @@ def test_full_context_loss_is_finite_and_causal(dim, context, monkeypatch):
 
     def record(model_output, loc, scale, target, observed_values):
         captured.append(model_output.detach().clone())
-        assert model_output.shape[1] == target.shape[1] == context - 1 + model.prediction_length
+        assert model_output.shape[1] == target.shape[1] == model.prediction_length
         return original(model_output, loc, scale, target, observed_values)
 
     monkeypatch.setattr(model, "get_loss_values", record)
@@ -138,7 +155,7 @@ def test_full_context_loss_is_finite_and_causal(dim, context, monkeypatch):
     changed["future_target"][:, 1] += 10
     with torch.no_grad():
         model.loss(**changed, future_only=False)
-    torch.testing.assert_close(captured[0][:, :context + 1], captured[1][:, :context + 1])
+    torch.testing.assert_close(captured[0][:, :2], captured[1][:, :2])
 
 
 @pytest.mark.parametrize("dim", [1, 2])
@@ -176,23 +193,25 @@ def test_single_context_step_has_no_extra_history_targets(kind, dim):
     torch.testing.assert_close(full_loss, future_loss)
 
 
-def test_auxiliary_context_conditioning_does_not_see_later_targets(monkeypatch):
-    from gluonts.torch.scaler import NOPScaler
-
-    model = make_model("trans", context=4)
-    # Keep scale fixed to isolate the attention dependency from normalization.
-    model.encoder_decoder.scaler = NOPScaler(dim=1, keepdim=True)
+@pytest.mark.parametrize("kind", ["rnn", "trans"])
+def test_auxiliary_context_conditioning_does_not_see_later_targets(kind, monkeypatch):
+    model = make_model(kind, context=4)
     batch = make_batch(model)
     outputs = []
+    original = model._one_step_conditioning
 
-    def record(model_output, **kwargs):
-        outputs.append(model_output.detach().clone())
-        return model_output.sum(-1)
+    def record(*args):
+        loc, scale, context = original(*args)
+        outputs.append((loc.detach().clone(), scale.detach().clone(), context.detach().clone()))
+        return loc, scale, context
 
-    monkeypatch.setattr(model, "get_loss_values", record)
+    monkeypatch.setattr(model, "_one_step_conditioning", record)
     with torch.no_grad():
         model.loss(**batch, future_only=False)
-        batch["past_target"][:, -2] += 10
+        batch["past_target"][:, -2] += 100
         model.loss(**batch, future_only=False)
-    # The first two auxiliary targets precede or equal the changed target.
-    torch.testing.assert_close(outputs[0][:, :2], outputs[1][:, :2])
+    # All normalization and hidden state for the first two auxiliary targets
+    # precede the changed observation; test with the actual default mean scaler.
+    for before, after in zip(outputs[:2], outputs[3:5], strict=True):
+        for x, y in zip(before, after, strict=True):
+            torch.testing.assert_close(x, y)

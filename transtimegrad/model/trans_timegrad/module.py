@@ -13,21 +13,26 @@
 
 from typing import List, Optional
 
-from diffusers import SchedulerMixin
-from diffusers.utils.torch_utils import randn_tensor
-from gluonts.core.component import validated
-from gluonts.itertools import prod
-from gluonts.model import Input, InputSpec
-from gluonts.torch.modules.feature import FeatureEmbedder
-from gluonts.torch.scaler import MeanScaler, NOPScaler, Scaler, StdScaler
-from gluonts.torch.util import repeat_along_dim
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from diffusers import SchedulerMixin
+from gluonts.core.component import validated
+from gluonts.itertools import prod
+from gluonts.model import InputSpec
+from gluonts.torch.util import repeat_along_dim
 
+from ...modules import StudentTOutput
+from ...util import get_lags_for_frequency
+from ..diffusion import (
+    auxiliary_context_losses,
+    diffusion_loss,
+    diffusion_sample,
+    validate_features,
+    validate_model_config,
+    validate_scheduler,
+)
 from ..epsilon_theta import EpsilonTheta
 from ..transformer import TransformerModel
-from ...util import get_lags_for_frequency
 
 
 class TransTimeGradModel(nn.Module):
@@ -76,6 +81,7 @@ class TransTimeGradModel(nn.Module):
         Number of samples to produce when unrolling the Model in the prediction
         time range.
     """
+
     @validated()
     def __init__(
         self,
@@ -87,26 +93,26 @@ class TransTimeGradModel(nn.Module):
         num_feat_dynamic_real: int = 1,
         num_feat_static_real: int = 1,
         num_feat_static_cat: int = 1,
-        cardinality: List[int] = [1],
+        cardinality: Optional[List[int]] = None,
         embedding_dimension: Optional[List[int]] = None,
         num_layers: int = 2,
         hidden_size: int = 40,
         dropout_rate: float = 0.1,
         lags_seq: Optional[List[int]] = None,
         scaling: Optional[str] = "mean",
-        default_scale: float = 0.0,
+        default_scale: Optional[float] = None,
         num_parallel_samples: int = 100,
         num_inference_steps: int = 100,
     ) -> None:
         super().__init__()
+        cardinality = [1] if cardinality is None else list(cardinality)
 
-        assert num_feat_dynamic_real > 0
-        assert num_feat_static_real > 0
-        assert num_feat_static_cat > 0
-        assert len(cardinality) == num_feat_static_cat
-        assert (
-            embedding_dimension is None
-            or len(embedding_dimension) == num_feat_static_cat
+        validate_features(
+            num_feat_dynamic_real,
+            num_feat_static_real,
+            num_feat_static_cat,
+            cardinality,
+            embedding_dimension,
         )
 
         self.context_length = context_length
@@ -121,115 +127,53 @@ class TransTimeGradModel(nn.Module):
             if embedding_dimension is not None or cardinality is None
             else [min(50, (cat + 1) // 2) for cat in cardinality]
         )
-        self.lags_seq = lags_seq or get_lags_for_frequency(freq_str=freq)
-        # self.lags_seq = [lag - 1 for lag in self.lags_seq]
+        self.lags_seq = (
+            get_lags_for_frequency(freq_str=freq) if lags_seq is None else list(lags_seq)
+        )
+        validate_model_config(
+            context_length,
+            prediction_length,
+            input_size,
+            self.lags_seq,
+            scaling,
+            num_parallel_samples,
+        )
         self.num_parallel_samples = num_parallel_samples
         self.past_length = self.context_length + max(self.lags_seq)
-        self.embedder = FeatureEmbedder(
-            cardinalities=cardinality,
-            embedding_dims=self.embedding_dimension,
-        )
-        if scaling == "mean":
-            self.scaler: Scaler = MeanScaler(
-                dim=1, keepdim=True, default_scale=default_scale
-            )
-        elif scaling == "std":
-            self.scaler: Scaler = StdScaler(dim=1, keepdim=True)
-        else:
-            self.scaler: Scaler = NOPScaler(dim=1, keepdim=True)
-        # model_input_size = (
-        #     self.input_size * len(self.lags_seq) + self._number_of_features
-        # )
-
-        ########
-        nhead = 8
-        dim_feedforward_scale = 4
-        activation = "gelu"
-        # distr_output = StudentTOutput()
-        
         self.encoder_decoder = TransformerModel(
             freq=freq,
             context_length=self.context_length,
             prediction_length=self.prediction_length,
             d_model=hidden_size,
-            nhead=nhead,
+            nhead=8,
             num_encoder_layers=num_layers,
             num_decoder_layers=num_layers,
-            dim_feedforward=dim_feedforward_scale*hidden_size,
-            activation=activation,
+            dim_feedforward=4 * hidden_size,
+            activation="gelu",
             dropout=dropout_rate,
             input_size=input_size,
+            distr_output=StudentTOutput(dim=input_size) if input_size > 1 else StudentTOutput(),
             num_feat_dynamic_real=self.num_feat_dynamic_real,
             num_feat_static_real=self.num_feat_static_real,
             num_feat_static_cat=self.num_feat_static_cat,
             cardinality=cardinality,
             embedding_dimension=self.embedding_dimension,
-            # distr_output=distr_output,
             lags_seq=self.lags_seq,
             scaling=scaling,
             default_scale=default_scale,
             num_parallel_samples=self.num_parallel_samples,
-        ).type(torch.float64)
-        ########
+        )
 
         self.unet = EpsilonTheta(
-            target_dim=input_size, cond_dim=hidden_size,
+            target_dim=input_size,
+            cond_dim=hidden_size,
             max_steps=scheduler.config.num_train_timesteps,
-        ).type(torch.float64)
-        self.scheduler = scheduler
+        )
+        self.scheduler = validate_scheduler(scheduler, num_inference_steps)
         self.num_inference_steps = num_inference_steps
 
     def describe_inputs(self, batch_size=1) -> InputSpec:
-        return InputSpec(
-            {
-                "feat_static_cat": Input(
-                    shape=(batch_size, self.num_feat_static_cat),
-                    dtype=torch.long,
-                ),
-                "feat_static_real": Input(
-                    shape=(batch_size, self.num_feat_static_real),
-                    dtype=torch.float,
-                ),
-                "past_time_feat": Input(
-                    shape=(
-                        batch_size,
-                        self._past_length,
-                        self.num_feat_dynamic_real,
-                    ),
-                    dtype=torch.float,
-                ),
-                "past_target": Input(
-                    shape=(batch_size, self._past_length)
-                    if self.input_size == 1
-                    else (batch_size, self._past_length, self.input_size),
-                    dtype=torch.float,
-                ),
-                "past_observed_values": Input(
-                    shape=(batch_size, self._past_length)
-                    if self.input_size == 1
-                    else (batch_size, self._past_length, self.input_size),
-                    dtype=torch.float,
-                ),
-                "future_time_feat": Input(
-                    shape=(
-                        batch_size,
-                        self.prediction_length,
-                        self.num_feat_dynamic_real,
-                    ),
-                    dtype=torch.float,
-                ),
-            },
-            zeros_fn=torch.zeros,
-        )
-
-    @property
-    def _number_of_features(self) -> int:
-        return (
-            sum(self.embedding_dimension)
-            + self.num_feat_dynamic_real
-            + self.num_feat_static_real
-            + self.input_size * 2  # the log(scale) and log1p(abs(loc))
-        )
+        return self.encoder_decoder.describe_inputs(batch_size)
 
     @property
     def _past_length(self) -> int:
@@ -272,8 +216,11 @@ class TransTimeGradModel(nn.Module):
             (Optional) How many future samples to produce.
             By default, self.num_parallel_samples is used.
         """
+        past_target = torch.where(past_observed_values.bool(), past_target, 0.0)
         if num_parallel_samples is None:
             num_parallel_samples = self.num_parallel_samples
+        if num_parallel_samples < 1:
+            raise ValueError("num_parallel_samples must be positive")
 
         encoder_inputs, loc, scale, static_feat = self.encoder_decoder.create_network_inputs(
             feat_static_cat,
@@ -284,37 +231,27 @@ class TransTimeGradModel(nn.Module):
             # future_time_feat[:, :1],
         )
         enc_pos = self.encoder_decoder.pos_embedding(encoder_inputs.size())
-        enc_out = self.encoder_decoder.transformer.encoder(self.encoder_decoder.enc_embedding(encoder_inputs) + enc_pos)
-
-        repeated_scale = scale.repeat_interleave(
-            repeats=num_parallel_samples, dim=0
+        enc_out = self.encoder_decoder.transformer.encoder(
+            self.encoder_decoder.enc_embedding(encoder_inputs) + enc_pos
         )
+
+        repeated_scale = scale.repeat_interleave(repeats=num_parallel_samples, dim=0)
         repeated_loc = loc.repeat_interleave(repeats=num_parallel_samples, dim=0)
 
         repeated_past_target = (
-            past_target.repeat_interleave(repeats=num_parallel_samples, dim=0)
-            - repeated_loc
+            past_target.repeat_interleave(repeats=num_parallel_samples, dim=0) - repeated_loc
         ) / repeated_scale
 
-        expanded_static_feat = static_feat.unsqueeze(1).expand(
-            -1, future_time_feat.shape[1], -1
-        )
+        expanded_static_feat = static_feat.unsqueeze(1).expand(-1, future_time_feat.shape[1], -1)
         features = torch.cat((expanded_static_feat, future_time_feat), dim=-1)
-        repeated_features = features.repeat_interleave(
-            repeats=num_parallel_samples, dim=0
-        )
+        repeated_features = features.repeat_interleave(repeats=num_parallel_samples, dim=0)
 
-        repeated_enc_out = enc_out.repeat_interleave(
-            repeats=num_parallel_samples, dim=0
-        )
+        repeated_enc_out = enc_out.repeat_interleave(repeats=num_parallel_samples, dim=0)
 
         future_samples = []
 
         # greedy decoding
         for k in range(self.prediction_length):
-            # self.encoder_decoder._check_shapes(repeated_past_target, next_sample, next_features)
-            # sequence = torch.cat((repeated_past_target, next_sample), dim=1)
-
             lagged_sequence = self.encoder_decoder.get_lagged_subsequences(
                 sequence=repeated_past_target,
                 subsequences_length=1 + k,
@@ -322,9 +259,7 @@ class TransTimeGradModel(nn.Module):
             )
 
             lags_shape = lagged_sequence.shape
-            reshaped_lagged_sequence = lagged_sequence.reshape(
-                lags_shape[0], lags_shape[1], -1
-            )
+            reshaped_lagged_sequence = lagged_sequence.reshape(lags_shape[0], lags_shape[1], -1)
 
             decoder_input = torch.cat(
                 (reshaped_lagged_sequence, repeated_features[:, : k + 1]), dim=-1
@@ -336,17 +271,13 @@ class TransTimeGradModel(nn.Module):
             output = self.encoder_decoder.transformer.decoder(
                 self.encoder_decoder.dec_embedding(decoder_input) + dec_pos,
                 repeated_enc_out,
-                tgt_mask=self.encoder_decoder.tgt_mask[:k + 1, :k + 1],
+                tgt_mask=self.encoder_decoder.tgt_mask[: k + 1, : k + 1],
             )
 
-            # params = self.encoder_decoder.param_proj(output[:, -1:])
-            # distr = self.encoder_decoder.output_distribution(
             #     params, loc=repeated_loc, scale=repeated_scale
-            # )
-            # next_sample = distr.sample()
 
             next_sample = self.sample(output[:, -1:], loc=repeated_loc, scale=repeated_scale)
-            
+
             repeated_past_target = torch.cat(
                 (repeated_past_target, (next_sample - repeated_loc) / repeated_scale),
                 dim=1,
@@ -357,71 +288,24 @@ class TransTimeGradModel(nn.Module):
         concat_future_samples = concat_future_samples.reshape(
             (-1, num_parallel_samples, self.prediction_length, self.input_size)
         ).squeeze(-1)
-#         concat_future_samples = concat_future_samples.reshape(
-#             (-1, num_parallel_samples, self.prediction_length) + self.encoder_decoder.target_shape,
-#         )
-        
+
         return concat_future_samples
-    
+
     def get_loss_values(self, model_output, loc, scale, target, observed_values):
-        B, T = model_output.shape[:2]
-        # Sample a random timestep for each sample in the batch
-        timesteps = torch.randint(
-            0,
-            self.scheduler.config.num_train_timesteps,
-            (B * T,),
-            device=model_output.device,
-        ).long()
-        noise = torch.randn(target.shape, device=target.device)
-
-        scaled_target = (target - loc) / scale
-
-        noisy_output = self.scheduler.add_noise(
-            scaled_target.view(B * T, 1, -1), noise.view(B * T, 1, -1), timesteps
-        )
-
-        model_output = self.unet(
-            noisy_output.type(torch.float64),
-            timesteps.type(torch.float64),
-            model_output.reshape(B * T, 1, -1).type(torch.float64),
-        )
-        if self.scheduler.config.prediction_type == "epsilon":
-            target_noise = noise
-        elif self.scheduler.config.prediction_type == "v_prediction":
-            target_noise = self.scheduler.get_velocity(
-                scaled_target.view(B * T, 1, -1),
-                noise.view(B * T, 1, -1),
-                timesteps,
-            )
-
-        return (
-            F.smooth_l1_loss(
-                model_output.view(B, T, -1),
-                target_noise.view(B, T, -1),
-                reduction="none",
-            ).mean(-1)
-            * observed_values
+        return diffusion_loss(
+            self.unet, self.scheduler, model_output, loc, scale, target, observed_values
         )
 
     def sample(self, context, loc, scale):
-        # context [B, T, H]
-        # loc [B, 1, D]
-        # scale [B, 1, D]
-        B, T = context.shape[:2]
-        sample_shape = (B * T, 1, self.input_size)
-        sample = randn_tensor(sample_shape, device=context.device)
-
-        self.scheduler.set_timesteps(self.num_inference_steps)
-        for t in self.scheduler.timesteps:
-            model_output = self.unet(
-                sample.type(torch.float64),
-                t.type(torch.float64),
-                context.view(B * T, 1, -1).type(torch.float64),
-            )
-            sample = self.scheduler.step(model_output, t, sample).prev_sample
-
-        sample = sample.view(B, T) if self.input_size == 1 else sample.view(B, T, -1)
-        return sample * scale + loc
+        return diffusion_sample(
+            self.unet,
+            self.scheduler,
+            context,
+            loc,
+            scale,
+            self.input_size,
+            self.num_inference_steps,
+        )
 
     def loss(
         self,
@@ -438,9 +322,9 @@ class TransTimeGradModel(nn.Module):
     ) -> torch.Tensor:
         # A one-step context has no auxiliary targets.
         future_only = future_only or self.context_length == 1
+        future_target = torch.where(future_observed_values.bool(), future_target, 0.0)
         extra_dims = len(future_target.shape) - len(past_target.shape)
         extra_shape = future_target.shape[:extra_dims]
-        # batch_shape = future_target.shape[: extra_dims + 1]
 
         repeats = prod(extra_shape)
         feat_static_cat = repeat_along_dim(feat_static_cat, 0, repeats)
@@ -452,11 +336,11 @@ class TransTimeGradModel(nn.Module):
 
         future_target_reshaped = future_target.reshape(
             -1,
-            *future_target.shape[extra_dims + 1:],
+            *future_target.shape[extra_dims + 1 :],
         )
         future_observed_reshaped = future_observed_values.reshape(
             -1,
-            *future_observed_values.shape[extra_dims + 1:],
+            *future_observed_values.shape[extra_dims + 1 :],
         )
 
         transformer_inputs, loc, scale, _ = self.encoder_decoder.create_network_inputs(
@@ -467,84 +351,60 @@ class TransTimeGradModel(nn.Module):
             past_observed_values,
             future_time_feat,
             future_target_reshaped,
-            # future_target,
         )
 
-        enc_input = self.encoder_decoder.enc_embedding(
-            transformer_inputs[:, :self.context_length]
-        )
+        enc_input = self.encoder_decoder.enc_embedding(transformer_inputs[:, : self.context_length])
         enc_pos = self.encoder_decoder.pos_embedding(enc_input.size())
-        enc_mask = None
-        if not future_only:
-            # Context losses must not attend to later context tokens through memory.
-            enc_mask = self.encoder_decoder.transformer.generate_square_subsequent_mask(
-                self.context_length, device=enc_input.device, dtype=enc_input.dtype
-            )
-        enc_out = self.encoder_decoder.transformer.encoder(enc_input + enc_pos, mask=enc_mask)
-
-        if future_only:
-            decoder_inputs = transformer_inputs[:, self.context_length:]
-            position_offset = self.context_length
-            tgt_mask = self.encoder_decoder.tgt_mask
-            memory_mask = None
-        else:
-            # Teacher force the context and future in one causal decoder pass.
-            # Drop the first context output, just as the RNN loss does.
-            decoder_inputs = transformer_inputs
-            position_offset = 0
-            length = decoder_inputs.shape[1]
-            tgt_mask = self.encoder_decoder.transformer.generate_square_subsequent_mask(
-                length, device=enc_input.device, dtype=enc_input.dtype
-            )
-            query = torch.arange(length, device=enc_input.device)[:, None]
-            key = torch.arange(self.context_length, device=enc_input.device)[None, :]
-            memory_mask = torch.zeros(
-                length, self.context_length, device=enc_input.device, dtype=enc_input.dtype
-            ).masked_fill(key > query, float("-inf"))
-
-        dec_input = self.encoder_decoder.dec_embedding(decoder_inputs)
-        dec_pos = self.encoder_decoder.pos_embedding(
-            dec_input.size(), past_key_values_length=position_offset
-        )
+        # The primary forecast path is identical for both loss modes and inference.
+        enc_out = self.encoder_decoder.transformer.encoder(enc_input + enc_pos)
+        future_inputs = transformer_inputs[:, self.context_length :]
+        future_emb = self.encoder_decoder.dec_embedding(future_inputs)
+        future_pos = self.encoder_decoder.pos_embedding(future_emb.size(), self.context_length)
         dec_output = self.encoder_decoder.transformer.decoder(
-            dec_input + dec_pos, enc_out, tgt_mask=tgt_mask, memory_mask=memory_mask
+            future_emb + future_pos, enc_out, tgt_mask=self.encoder_decoder.tgt_mask
         )
-        if not future_only:
-            dec_output = dec_output[:, 1:]
+        future_output = dec_output[:, -self.prediction_length :]
+        loss_values = self.get_loss_values(
+            model_output=future_output,
+            loc=loc,
+            scale=scale,
+            target=future_target_reshaped,
+            observed_values=future_observed_reshaped,
+        )
+        if not future_only and self.context_length > 1:
+            context_losses = auxiliary_context_losses(
+                self,
+                feat_static_cat,
+                feat_static_real,
+                past_time_feat,
+                past_target,
+                past_observed_values,
+            )
+            loss_values = torch.cat((*context_losses, loss_values), dim=1)
+        return aggregate_by(loss_values, dim=1)
 
-        if future_only:
-            sliced_dec_output = dec_output[:, -self.prediction_length:]
-            observed_values = (
-                future_observed_reshaped.all(-1)
-                if future_observed_reshaped.ndim == 3
-                else future_observed_reshaped
-            )
-            loss_values = self.get_loss_values(
-                model_output=sliced_dec_output,
-                loc=loc,
-                scale=scale,
-                target=future_target_reshaped,
-                observed_values=observed_values,
-            )
-        else:
-            context_target = past_target[:, -self.context_length:][:, 1:]
-            target = torch.cat((context_target, future_target_reshaped), dim=1)
-            context_observed = past_observed_values[:, -self.context_length:][:, 1:]
-            observed_values = torch.cat(
-                (context_observed, future_observed_reshaped), dim=1
-            )
-            observed_values = (
-                observed_values.all(-1)
-                if observed_values.ndim == 3
-                else observed_values
-            )
-
-            loss_values = self.get_loss_values(
-                model_output=dec_output,
-                loc=loc,
-                scale=scale,
-                target=target,
-                observed_values=observed_values,
-            )
-
-        return aggregate_by(loss_values, dim=(1,))
+    def _one_step_conditioning(
+        self,
+        feat_static_cat,
+        feat_static_real,
+        past_time_feat,
+        past_target,
+        past_observed_values,
+        future_time_feat,
+    ):
+        past_target = torch.where(past_observed_values.bool(), past_target, 0.0)
+        backbone = self.encoder_decoder
+        inputs, loc, scale, static = backbone.create_network_inputs(
+            feat_static_cat, feat_static_real, past_time_feat, past_target, past_observed_values
+        )
+        memory = backbone.transformer.encoder(
+            backbone.enc_embedding(inputs) + backbone.pos_embedding(inputs.size())
+        )
+        lags = backbone.get_lagged_subsequences(past_target.sub(loc).div(scale), 1, shift=1)
+        features = torch.cat((static.unsqueeze(1), future_time_feat), dim=-1)
+        decoder_input = torch.cat((lags.reshape(lags.shape[0], 1, -1), features), dim=-1)
+        positions = backbone.pos_embedding(decoder_input.size(), self.context_length)
+        output = backbone.transformer.decoder(
+            backbone.dec_embedding(decoder_input) + positions, memory
+        )
+        return loc, scale, output
