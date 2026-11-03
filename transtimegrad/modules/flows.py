@@ -325,15 +325,17 @@ class Flow(nn.Module):
 
     def forward(self, x, cond):
         if self.scale is not None:
-            x /= self.scale
+            x = x / self.scale
         u, log_abs_det_jacobian = self.net(x, cond)
+        if self.scale is not None:
+            log_abs_det_jacobian = log_abs_det_jacobian - torch.log(torch.abs(self.scale))
         return u, log_abs_det_jacobian
 
     def inverse(self, u, cond):
         x, log_abs_det_jacobian = self.net.inverse(u, cond)
         if self.scale is not None:
-            x *= self.scale
-            log_abs_det_jacobian += torch.log(torch.abs(self.scale))
+            x = x * self.scale
+            log_abs_det_jacobian = log_abs_det_jacobian + torch.log(torch.abs(self.scale))
         return x, log_abs_det_jacobian
 
     def log_prob(self, x, cond):

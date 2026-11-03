@@ -143,8 +143,7 @@ predictor = prepare_predictor(
     lags_seq=[1, 7, 14, 24, 168], num_inference_steps=99, batch_size=64, num_batches_per_epoch=100)
 forecasts, targets, agg_metric = prepare_metrics(dataset, predictor)
 prepare_statistics(
-    dataset["dataset"], dataset["forecasts"],
-    dataset["targets"], dataset["agg_metric"]
+    dataset, forecasts, targets, agg_metric
 )
 ```
 
@@ -155,3 +154,12 @@ We thank the following repositories, papers and their authors and do not claim a
 
 ## License
 [MIT]() License
+
+## Tests
+
+Use Python 3.9–3.11 with the pinned dependencies:
+
+```bash
+python -m pip install -e ".[test]"
+python -m pytest tests
+```
