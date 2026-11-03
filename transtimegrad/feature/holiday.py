@@ -1,8 +1,8 @@
 from typing import Callable, List
 
-from gluonts.time_feature.holiday import distance_to_holiday, indicator
 import numpy as np
 import pandas as pd
+from gluonts.time_feature.holiday import distance_to_holiday, indicator
 from pandas.tseries.holiday import Holiday
 
 
@@ -75,14 +75,10 @@ class CustomDateFeatureSet:
         dates
             Pandas series with Datetimeindex timestamps.
         """
-        return np.vstack(
-            [
-                np.hstack(
-                    [self.kernel_function((index - ref_date).days) for index in dates]
-                )
-                for ref_date in self.reference_dates
-            ]
-        ).sum(0, keepdims=True)
+        values = np.zeros((1, len(dates)), dtype=float)
+        for ref_date in self.reference_dates:
+            values[0] += [self.kernel_function((index - ref_date).days) for index in dates]
+        return values
 
 
 class CustomHolidayFeatureSet:
@@ -158,14 +154,8 @@ class CustomHolidayFeatureSet:
         dates
             Pandas series with Datetimeindex timestamps.
         """
-        return np.vstack(
-            [
-                np.hstack(
-                    [
-                        self.kernel_function(distance_to_holiday(custom_holiday)(index))
-                        for index in dates
-                    ]
-                )
-                for custom_holiday in self.custom_holidays
-            ]
-        )
+        values = np.zeros((len(self.custom_holidays), len(dates)), dtype=float)
+        for row, holiday in enumerate(self.custom_holidays):
+            distance = distance_to_holiday(holiday)
+            values[row] = [self.kernel_function(distance(index)) for index in dates]
+        return values

@@ -13,17 +13,19 @@
 
 from typing import List, Optional
 
-from gluonts.core.component import validated
-from gluonts.model import Input, InputSpec
-from gluonts.torch.distributions import DistributionOutput, StudentTOutput
-from gluonts.torch.modules.loss import DistributionLoss, NegativeLogLikelihood
-from gluonts.torch.modules.feature import FeatureEmbedder
-from gluonts.torch.scaler import MeanScaler, NOPScaler, Scaler, StdScaler
 import numpy as np
 import torch
 import torch.nn as nn
+from gluonts.core.component import validated
+from gluonts.model import Input, InputSpec
+from gluonts.torch.distributions import DistributionOutput
+from gluonts.torch.modules.feature import FeatureEmbedder
+from gluonts.torch.scaler import MeanScaler, NOPScaler, Scaler, StdScaler
 
+from ...modules import StudentTOutput
 from ...util import get_lags_for_frequency
+from ..diffusion import validate_features, validate_model_config
+from ..loss import DistributionLoss, NegativeLogLikelihood, masked_loss
 
 
 class ValueEmbedding(nn.Module):
@@ -63,9 +65,7 @@ class PositionalEmbedding(nn.Embedding):
         return out
 
     @torch.no_grad()
-    def forward(
-        self, input_ids_shape: torch.Size, past_key_values_length: int = 0
-    ) -> torch.Tensor:
+    def forward(self, input_ids_shape: torch.Size, past_key_values_length: int = 0) -> torch.Tensor:
         """`input_ids_shape` is expected to be [bsz x seqlen]."""
         _, seq_len = input_ids_shape[:2]
         positions = torch.arange(
@@ -97,19 +97,34 @@ class TransformerModel(nn.Module):
         num_feat_dynamic_real: int = 1,
         num_feat_static_real: int = 1,
         num_feat_static_cat: int = 1,
-        cardinality: List[int] = [1],
+        cardinality: Optional[List[int]] = None,
         embedding_dimension: Optional[List[int]] = None,
-        distr_output: DistributionOutput = StudentTOutput(),
+        distr_output: Optional[DistributionOutput] = None,
         lags_seq: Optional[List[int]] = None,
         scaling: Optional[str] = "mean",
-        default_scale: float = 0.0,
+        default_scale: Optional[float] = None,
         num_parallel_samples: int = 100,
     ) -> None:
         super().__init__()
 
+        cardinality = [1] if cardinality is None else list(cardinality)
+        validate_features(
+            num_feat_dynamic_real,
+            num_feat_static_real,
+            num_feat_static_cat,
+            cardinality,
+            embedding_dimension,
+        )
         self.input_size = input_size
+        if distr_output is None:
+            distr_output = StudentTOutput(dim=input_size) if input_size > 1 else StudentTOutput()
 
         self.target_shape = distr_output.event_shape
+        expected_shape = () if input_size == 1 else (input_size,)
+        if self.target_shape != expected_shape:
+            raise ValueError(
+                "distr_output.event_shape must match input_size (scalar for input_size=1)"
+            )
         self.num_feat_dynamic_real = num_feat_dynamic_real
         self.num_feat_static_cat = num_feat_static_cat
         self.num_feat_static_real = num_feat_static_real
@@ -118,7 +133,17 @@ class TransformerModel(nn.Module):
             if embedding_dimension is not None or cardinality is None
             else [min(50, (cat + 1) // 2) for cat in cardinality]
         )
-        self.lags_seq = lags_seq or get_lags_for_frequency(freq_str=freq)
+        self.lags_seq = (
+            get_lags_for_frequency(freq_str=freq) if lags_seq is None else list(lags_seq)
+        )
+        validate_model_config(
+            context_length,
+            prediction_length,
+            input_size,
+            self.lags_seq,
+            scaling,
+            num_parallel_samples,
+        )
         self.num_parallel_samples = num_parallel_samples
 
         self.embedder = FeatureEmbedder(
@@ -126,9 +151,7 @@ class TransformerModel(nn.Module):
             embedding_dims=self.embedding_dimension,
         )
         if scaling == "mean":
-            self.scaler: Scaler = MeanScaler(
-                dim=1, keepdim=True, default_scale=default_scale
-            )
+            self.scaler: Scaler = MeanScaler(dim=1, keepdim=True, default_scale=default_scale)
         elif scaling == "std":
             self.scaler: Scaler = StdScaler(dim=1, keepdim=True)
         else:
@@ -139,9 +162,7 @@ class TransformerModel(nn.Module):
         self.enc_embedding = ValueEmbedding(feature_size=feature_size, d_model=d_model)
         self.dec_embedding = ValueEmbedding(feature_size=feature_size, d_model=d_model)
 
-        self.pos_embedding = PositionalEmbedding(
-            context_length + prediction_length, d_model
-        )
+        self.pos_embedding = PositionalEmbedding(context_length + prediction_length, d_model)
 
         self.context_length = context_length
         self.prediction_length = prediction_length
@@ -247,10 +268,12 @@ class TransformerModel(nn.Module):
         sequence_length = sequence.shape[1]
         indices = [lag - shift for lag in self.lags_seq]
 
-        assert max(indices) + subsequences_length <= sequence_length, (
-            f"lags cannot go further than history length, found lag {max(indices)} "
-            f"while history length is only {sequence_length}"
-        )
+        if (
+            subsequences_length < 1
+            or min(indices) < 0
+            or max(indices) + subsequences_length > sequence_length
+        ):
+            raise ValueError("lag window must lie within the provided nonempty history")
 
         lagged_values = []
         for lag_index in indices:
@@ -273,18 +296,19 @@ class TransformerModel(nn.Module):
         time_feat = (
             torch.cat(
                 (
-                    past_time_feat[:, self._past_length - self.context_length:, ...],
+                    past_time_feat[:, self._past_length - self.context_length :, ...],
                     future_time_feat,
                 ),
                 dim=1,
             )
             if future_target is not None
-            else past_time_feat[:, self._past_length - self.context_length:, ...]
+            else past_time_feat[:, self._past_length - self.context_length :, ...]
         )
 
         # target
-        context = past_target[:, -self.context_length:, ...]
-        observed_context = past_observed_values[:, -self.context_length:, ...]
+        past_target = torch.where(past_observed_values.bool(), past_target, 0.0)
+        context = past_target[:, -self.context_length :, ...]
+        observed_context = past_observed_values[:, -self.context_length :, ...]
         _, loc, scale = self.scaler(context, observed_context)
 
         inputs = (
@@ -298,7 +322,10 @@ class TransformerModel(nn.Module):
             if future_target is not None
             else self._past_length
         )
-        assert inputs.shape[1] == inputs_length
+        if inputs.shape[1] != inputs_length:
+            raise ValueError(
+                "target history length does not match the configured lag/context window"
+            )
 
         subsequences_length = (
             self.context_length + self.prediction_length
@@ -308,33 +335,24 @@ class TransformerModel(nn.Module):
 
         # embeddings
         embedded_cat = self.embedder(feat_static_cat)
-        log_abs_loc = (
-            loc.abs().log1p() if self.input_size == 1 else loc.squeeze(1).abs().log1p()
-        )
+        log_abs_loc = loc.abs().log1p() if self.input_size == 1 else loc.squeeze(1).abs().log1p()
         log_scale = scale.log() if self.input_size == 1 else scale.squeeze(1).log()
 
         static_feat = torch.cat(
             (embedded_cat, feat_static_real, log_abs_loc, log_scale),
             dim=1,
         )
-        expanded_static_feat = static_feat.unsqueeze(1).expand(
-            -1, time_feat.shape[1], -1
-        )
+        expanded_static_feat = static_feat.unsqueeze(1).expand(-1, time_feat.shape[1], -1)
 
         features = torch.cat((expanded_static_feat, time_feat), dim=-1)
 
-        # self._check_shapes(prior_input, inputs, features)
-
-        # sequence = torch.cat((prior_input, inputs), dim=1)
         lagged_sequence = self.get_lagged_subsequences(
             sequence=inputs,
             subsequences_length=subsequences_length,
         )
 
         lags_shape = lagged_sequence.shape
-        reshaped_lagged_sequence = lagged_sequence.reshape(
-            lags_shape[0], lags_shape[1], -1
-        )
+        reshaped_lagged_sequence = lagged_sequence.reshape(lags_shape[0], lags_shape[1], -1)
 
         transformer_inputs = torch.cat((reshaped_lagged_sequence, features), dim=-1)
 
@@ -373,21 +391,13 @@ class TransformerModel(nn.Module):
         )
 
     def output_params(self, transformer_inputs):
-        enc_input = self.enc_embedding(
-            transformer_inputs[:, : self.context_length, ...]
-        )
+        enc_input = self.enc_embedding(transformer_inputs[:, : self.context_length, ...])
         enc_pos = self.pos_embedding(enc_input.size())
         enc_out = self.transformer.encoder(enc_input + enc_pos)
 
-        dec_input = self.dec_embedding(
-            transformer_inputs[:, self.context_length:, ...]
-        )
-        dec_pos = self.pos_embedding(
-            dec_input.size(), past_key_values_length=self.context_length
-        )
-        dec_output = self.transformer.decoder(
-            dec_input + dec_pos, enc_out, tgt_mask=self.tgt_mask
-        )
+        dec_input = self.dec_embedding(transformer_inputs[:, self.context_length :, ...])
+        dec_pos = self.pos_embedding(dec_input.size(), past_key_values_length=self.context_length)
+        dec_output = self.transformer.decoder(dec_input + dec_pos, enc_out, tgt_mask=self.tgt_mask)
 
         return self.param_proj(dec_output)
 
@@ -404,6 +414,7 @@ class TransformerModel(nn.Module):
         loss: DistributionLoss = NegativeLogLikelihood(),
         aggregate_by=torch.mean,
     ) -> torch.Tensor:
+        future_target = torch.where(future_observed_values.bool(), future_target, 0.0)
         transformer_inputs, loc, scale, _ = self.create_network_inputs(
             feat_static_cat,
             feat_static_real,
@@ -416,13 +427,7 @@ class TransformerModel(nn.Module):
         params = self.output_params(transformer_inputs)
         distr = self.output_distribution(params, loc=loc, scale=scale)
 
-        observed_values = (
-            future_observed_values.all(-1)
-            if future_observed_values.ndim == 3
-            else future_observed_values
-        )
-
-        loss_values = loss(distr, future_target) * observed_values
+        loss_values = masked_loss(distr, future_target, future_observed_values, loss)
         return aggregate_by(loss_values, dim=(1,))
 
     # for prediction
@@ -436,8 +441,11 @@ class TransformerModel(nn.Module):
         future_time_feat: torch.Tensor,
         num_parallel_samples: Optional[int] = None,
     ) -> torch.Tensor:
+        past_target = torch.where(past_observed_values.bool(), past_target, 0.0)
         if num_parallel_samples is None:
             num_parallel_samples = self.num_parallel_samples
+        if num_parallel_samples < 1:
+            raise ValueError("num_parallel_samples must be positive")
 
         encoder_inputs, loc, scale, static_feat = self.create_network_inputs(
             feat_static_cat,
@@ -449,36 +457,24 @@ class TransformerModel(nn.Module):
         enc_pos = self.pos_embedding(encoder_inputs.size())
         enc_out = self.transformer.encoder(self.enc_embedding(encoder_inputs) + enc_pos)
 
-        repeated_scale = scale.repeat_interleave(
-            repeats=num_parallel_samples, dim=0
-        )
+        repeated_scale = scale.repeat_interleave(repeats=num_parallel_samples, dim=0)
 
         repeated_loc = loc.repeat_interleave(repeats=num_parallel_samples, dim=0)
 
         repeated_past_target = (
-            past_target.repeat_interleave(repeats=num_parallel_samples, dim=0)
-            - repeated_loc
+            past_target.repeat_interleave(repeats=num_parallel_samples, dim=0) - repeated_loc
         ) / repeated_scale
 
-        expanded_static_feat = static_feat.unsqueeze(1).expand(
-            -1, future_time_feat.shape[1], -1
-        )
+        expanded_static_feat = static_feat.unsqueeze(1).expand(-1, future_time_feat.shape[1], -1)
         features = torch.cat((expanded_static_feat, future_time_feat), dim=-1)
-        repeated_features = features.repeat_interleave(
-            repeats=num_parallel_samples, dim=0
-        )
+        repeated_features = features.repeat_interleave(repeats=num_parallel_samples, dim=0)
 
-        repeated_enc_out = enc_out.repeat_interleave(
-            repeats=num_parallel_samples, dim=0
-        )
+        repeated_enc_out = enc_out.repeat_interleave(repeats=num_parallel_samples, dim=0)
 
         future_samples = []
 
         # greedy decoding
         for k in range(self.prediction_length):
-            # self._check_shapes(repeated_past_target, next_sample, next_features)
-            # sequence = torch.cat((repeated_past_target, next_sample), dim=1)
-
             lagged_sequence = self.get_lagged_subsequences(
                 sequence=repeated_past_target,
                 subsequences_length=1 + k,
@@ -486,9 +482,7 @@ class TransformerModel(nn.Module):
             )
 
             lags_shape = lagged_sequence.shape
-            reshaped_lagged_sequence = lagged_sequence.reshape(
-                lags_shape[0], lags_shape[1], -1
-            )
+            reshaped_lagged_sequence = lagged_sequence.reshape(lags_shape[0], lags_shape[1], -1)
 
             decoder_input = torch.cat(
                 (reshaped_lagged_sequence, repeated_features[:, : k + 1]), dim=-1
@@ -498,14 +492,13 @@ class TransformerModel(nn.Module):
                 decoder_input.size(), past_key_values_length=self.context_length
             )
             output = self.transformer.decoder(
-                self.dec_embedding(decoder_input) + dec_pos, repeated_enc_out,
-                tgt_mask=self.tgt_mask[:k + 1, :k + 1],
+                self.dec_embedding(decoder_input) + dec_pos,
+                repeated_enc_out,
+                tgt_mask=self.tgt_mask[: k + 1, : k + 1],
             )
 
             params = self.param_proj(output[:, -1:])
-            distr = self.output_distribution(
-                params, loc=repeated_loc, scale=repeated_scale
-            )
+            distr = self.output_distribution(params, loc=repeated_loc, scale=repeated_scale)
             next_sample = distr.sample()
 
             repeated_past_target = torch.cat(

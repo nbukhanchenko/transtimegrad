@@ -1,34 +1,34 @@
-from setuptools import setup, find_packages
+from pathlib import Path
+
+from setuptools import find_packages, setup
+
 
 setup(
     name="transtimegrad",
-    version="1.0",
+    version="1.1.0",
     description="Transformer Based TimeGrad Model",
-    long_description=open("README.md").read(),
+    long_description=Path(__file__).with_name("README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
     author="Nikita Bukhanchenko",
     author_email="nbukhanchenko@nes.ru",
     url="https://github.com/nbukhanchenko/transtimegrad",
     license="MIT",
-    packages=find_packages(exclude=["tests"]),
-    include_package_data=True,
-    zip_safe=True,
-    python_requires=">=3.9,<3.12",
+    packages=find_packages(exclude=["tests", "tests.*"]),
+    python_requires=">=3.11",
     install_requires=[
-        "gluonts==0.14.3",
-        "seaborn==0.13.1",
-        "pandas==2.2.0",
-        "lightning==2.1.3",
-        "diffusers==0.25.1",
-        "huggingface-hub>=0.20.2,<0.26",
-        "setuptools<81",
-        "scipy>=1.10,<1.16",
-        "torchvision==0.17.2",
-        "torch==2.2.2",
-        "numpy==1.23.5",
-        "holidays",
-        "matplotlib",
-        "protobuf~=3.20.3",
+        "gluonts==0.16.3",
+        "lightning==2.6.6",
+        "diffusers==0.42.1",
+        "torch==2.15.0",
+        "numpy>=1.26.4,<3",
+        "pandas>=2.2.3,<3",
+        "scipy>=1.15.3,<2",
+        "safetensors>=0.8.0,<1",
+        "fsspec>=2026.6.0,<2027",
     ],
-    extras_require={"test": ["pytest>=7,<9"]},
+    extras_require={
+        "test": ["pytest>=9.0.3,<10"],
+        "examples": ["matplotlib>=3.10,<4"],
+        "audit": ["pip-audit>=2.10,<3"],
+    },
 )

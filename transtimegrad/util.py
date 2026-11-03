@@ -14,12 +14,10 @@
 import inspect
 from typing import List, Optional
 
-from gluonts.time_feature import norm_freq_str
-from gluonts.torch.util import slice_along_dim
 import numpy as np
-from pandas.tseries.frequencies import to_offset
 import torch
 import torch.nn as nn
+from pandas.tseries.frequencies import to_offset
 
 
 def _make_lags(middle: int, delta: int) -> np.ndarray:
@@ -65,69 +63,80 @@ def get_lags_for_frequency(
     # previous cycle.
     def _make_lags_for_second(multiple, num_cycles=3):
         # We use previous ``num_cycles`` hours to generate lags
-        return [
-            _make_lags(k * 60 // multiple, 2) for k in range(1, num_cycles + 1)
-        ]
+        return [_make_lags(k * 60 // multiple, 2) for k in range(1, num_cycles + 1)]
 
     def _make_lags_for_minute(multiple, num_cycles=3):
         # We use previous ``num_cycles`` hours to generate lags
-        return [
-            _make_lags(k * 60 // multiple, 2) for k in range(1, num_cycles + 1)
-        ]
+        return [_make_lags(k * 60 // multiple, 2) for k in range(1, num_cycles + 1)]
 
     def _make_lags_for_hour(multiple, num_cycles=7):
         # We use previous ``num_cycles`` days to generate lags
-        return [
-            _make_lags(k * 24 // multiple, 1) for k in range(1, num_cycles + 1)
-        ]
+        return [_make_lags(k * 24 // multiple, 1) for k in range(1, num_cycles + 1)]
 
-    def _make_lags_for_day(
-        multiple, num_cycles=4, days_in_week=7, days_in_month=30
-    ):
+    def _make_lags_for_day(multiple, num_cycles=4, days_in_week=7, days_in_month=30):
         # We use previous ``num_cycles`` weeks to generate lags
         # We use the last month (in addition to 4 weeks) to generate lag.
-        return [
-            _make_lags(k * days_in_week // multiple, 1)
-            for k in range(1, num_cycles + 1)
-        ] + [_make_lags(days_in_month // multiple, 1)]
+        return [_make_lags(k * days_in_week // multiple, 1) for k in range(1, num_cycles + 1)] + [
+            _make_lags(days_in_month // multiple, 1)
+        ]
 
     def _make_lags_for_week(multiple, num_cycles=3):
         # We use previous ``num_cycles`` years to generate lags
         # Additionally, we use previous 4, 8, 12 weeks
-        return [
-            _make_lags(k * 52 // multiple, 1) for k in range(1, num_cycles + 1)
-        ] + [[4 // multiple, 8 // multiple, 12 // multiple]]
+        return [_make_lags(k * 52 // multiple, 1) for k in range(1, num_cycles + 1)] + [
+            [4 // multiple, 8 // multiple, 12 // multiple]
+        ]
 
     def _make_lags_for_month(multiple, num_cycles=3):
         # We use previous ``num_cycles`` years to generate lags
-        return [
-            _make_lags(k * 12 // multiple, 1) for k in range(1, num_cycles + 1)
-        ]
+        return [_make_lags(k * 12 // multiple, 1) for k in range(1, num_cycles + 1)]
 
-    # multiple, granularity = get_granularity(freq_str)
+    if lag_ub < 1 or num_default_lags < 0 or (num_lags is not None and num_lags < 0):
+        raise ValueError("lag_ub must be positive and lag counts must be nonnegative")
     offset = to_offset(freq_str)
-    # normalize offset name, so that both `W` and `W-SUN` refer to `W`
-    offset_name = norm_freq_str(offset.name).lower()
+    if offset.n <= 0:
+        raise ValueError("frequency must have a positive multiple")
+    # pandas 2.2 renamed end offsets; start/end variants have the same season.
+    offset_name = offset.name.split("-")[0]
+    offset_name = {
+        "M": "m",
+        "ME": "m",
+        "MS": "m",
+        "BM": "m",
+        "BME": "m",
+        "BMS": "m",
+        "Q": "q",
+        "QE": "q",
+        "QS": "q",
+        "BQ": "q",
+        "BQE": "q",
+        "BQS": "q",
+        "A": "a",
+        "Y": "a",
+        "YE": "a",
+        "YS": "a",
+        "AS": "a",
+        "BA": "a",
+        "BYE": "a",
+        "BYS": "a",
+        "min": "t",
+        "T": "t",
+    }.get(offset_name, offset_name.lower())
 
     if offset_name == "a":
         lags = []
     elif offset_name == "q":
-        assert (
-            offset.n == 1
-        ), "Only multiple 1 is supported for quarterly. Use x month instead."
         lags = _make_lags_for_month(offset.n * 3.0)
     elif offset_name == "m":
         lags = _make_lags_for_month(offset.n)
     elif offset_name == "w":
         lags = _make_lags_for_week(offset.n)
     elif offset_name == "d":
-        lags = _make_lags_for_day(offset.n) + _make_lags_for_week(
-            offset.n / 7.0
-        )
+        lags = _make_lags_for_day(offset.n) + _make_lags_for_week(offset.n / 7.0)
     elif offset_name == "b":
-        lags = _make_lags_for_day(
-            offset.n, days_in_week=5, days_in_month=22
-        ) + _make_lags_for_week(offset.n / 5.0)
+        lags = _make_lags_for_day(offset.n, days_in_week=5, days_in_month=22) + _make_lags_for_week(
+            offset.n / 5.0
+        )
     elif offset_name == "h":
         lags = (
             _make_lags_for_hour(offset.n)
@@ -150,14 +159,15 @@ def get_lags_for_frequency(
             + _make_lags_for_hour(offset.n / (60 * 60))
         )
     else:
-        raise ValueError(f"invalid frequency | `freq_str={freq_str}` -> `offset_name={offset_name}`")
+        raise ValueError(
+            f"invalid frequency | `freq_str={freq_str}` -> `offset_name={offset_name}`"
+        )
 
     # flatten lags list and filter
-    lags = [
-        int(lag) for sub_list in lags for lag in sub_list if 7 < lag <= lag_ub
-    ]
-    lags = list(range(1, num_default_lags + 1)) + sorted(list(set(lags)))
-
+    seasonal = [int(lag) for group in lags for lag in group]
+    lags = sorted(
+        {lag for lag in list(range(1, num_default_lags + 1)) + seasonal if 0 < lag <= lag_ub}
+    )
     return lags[:num_lags]
 
 
@@ -194,35 +204,38 @@ def lagged_sequence_values(
     Tensor
         A tensor of shape (*sequence.shape, len(indices)).
     """
-    assert max(indices) <= prior_sequence.shape[dim], (
-        f"lags cannot go further than prior sequence length, found lag"
-        f" {max(indices)} while prior sequence is only"
-        f"{prior_sequence.shape[dim]}-long"
-    )
-
-    # if prior_sequence is a 2-tensor add an extra dimension
-    if len(prior_sequence.shape) == 2:
+    if not indices or any(
+        isinstance(index, bool) or not isinstance(index, (int, np.integer)) or index < 0
+        for index in indices
+    ):
+        raise ValueError("indices must be a nonempty list of nonnegative integers")
+    if prior_sequence.ndim != sequence.ndim or sequence.ndim < 2:
+        raise ValueError("prior_sequence and sequence must have matching ranks of at least two")
+    if not -sequence.ndim <= dim < sequence.ndim:
+        raise ValueError("dim is outside the sequence rank")
+    dim = dim % sequence.ndim
+    if max(indices) > prior_sequence.shape[dim]:
+        raise ValueError("lags cannot extend beyond the prior sequence")
+    if sequence.ndim == 2:
         prior_sequence = prior_sequence.unsqueeze(-1)
-    if len(sequence.shape) == 2:
         sequence = sequence.unsqueeze(-1)
 
     full_sequence = torch.cat((prior_sequence, sequence), dim=dim)
-
     lags_values = []
     for lag_index in indices:
-        begin_index = -lag_index - sequence.shape[dim]
-        end_index = -lag_index if lag_index > 0 else None
-        lags_values.append(
-            slice_along_dim(
-                full_sequence, dim=dim, slice_=slice(begin_index, end_index)
-            ).unsqueeze(-1)
-        )
+        end_index = full_sequence.shape[dim] - lag_index
+        begin_index = end_index - sequence.shape[dim]
+        selection = [slice(None)] * full_sequence.ndim
+        selection[dim] = slice(begin_index, end_index)
+        lags_values.append(full_sequence[tuple(selection)].unsqueeze(-1))
 
     lags_values = torch.cat(lags_values, dim=-1)
 
     if not keepdim:
         # merge the last two dimensions
-        lags_values = lags_values.reshape(*lags_values.shape[:-2], -1)
+        lags_values = lags_values.reshape(
+            *lags_values.shape[:-2], lags_values.shape[-2] * lags_values.shape[-1]
+        )
 
     return lags_values
 
@@ -250,13 +263,15 @@ def weighted_average(
         The tensor with values averaged along the specified `dim`.
     """
     if weights is not None:
-        weighted_tensor = torch.where(weights != 0, x * weights, torch.zeros_like(x))
-        sum_weights = torch.clamp(
-            weights.sum(dim=dim) if dim else weights.sum(), min=1.0
-        )
-        return (
-            weighted_tensor.sum(dim=dim) if dim else weighted_tensor.sum()
-        ) / sum_weights
+        weights = torch.broadcast_to(weights, x.shape)
+        # Mask before multiplying so missing values cannot poison gradients.
+        values = torch.where(weights != 0, x, torch.zeros_like(x))
+        weighted_tensor = values * weights
+        if not weighted_tensor.is_floating_point():
+            weighted_tensor = weighted_tensor.to(torch.get_default_dtype())
+        sum_weights = weights.sum(dim=dim)
+        denominator = torch.where(sum_weights != 0, sum_weights, torch.ones_like(sum_weights))
+        return weighted_tensor.sum(dim=dim) / denominator
     else:
         return x.mean(dim=dim)
 

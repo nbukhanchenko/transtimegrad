@@ -13,6 +13,7 @@
 
 from typing import Any, Dict, Iterable, List, Optional
 
+import torch
 from diffusers import SchedulerMixin
 from gluonts.core.component import validated
 from gluonts.dataset.common import Dataset
@@ -22,7 +23,6 @@ from gluonts.dataset.stat import calculate_dataset_statistics
 from gluonts.itertools import Cyclic
 from gluonts.time_feature import TimeFeature, time_features_from_frequency_str
 from gluonts.torch.model.estimator import PyTorchLightningEstimator
-from gluonts.torch.model.predictor import PyTorchPredictor
 from gluonts.transform import (
     AddAgeFeature,
     AddObservedValuesIndicator,
@@ -41,8 +41,8 @@ from gluonts.transform import (
     VstackFeatures,
 )
 from gluonts.transform.sampler import InstanceSampler
-import torch
 
+from ...serialization import TransTimeGradPredictor
 from .lightning_module import TimeGradLightningModule
 
 PREDICTION_INPUT_NAMES = [
@@ -135,6 +135,8 @@ class TimeGradEstimator(PyTorchLightningEstimator):
         Controls the sampling of windows during validation.
     """
 
+    lightning_module_type = TimeGradLightningModule
+
     @validated()
     def __init__(
         self,
@@ -155,7 +157,7 @@ class TimeGradEstimator(PyTorchLightningEstimator):
         cardinality: Optional[List[int]] = None,
         embedding_dimension: Optional[List[int]] = None,
         scaling: Optional[str] = "mean",
-        default_scale: float = 0.0,
+        default_scale: Optional[float] = None,
         lags_seq: Optional[List[int]] = None,
         time_features: Optional[List[TimeFeature]] = None,
         num_parallel_samples: int = 100,
@@ -177,9 +179,7 @@ class TimeGradEstimator(PyTorchLightningEstimator):
         self.input_size = input_size
         self.scheduler = scheduler
         self.num_inference_steps = num_inference_steps
-        self.context_length = (
-            context_length if context_length is not None else prediction_length
-        )
+        self.context_length = context_length if context_length is not None else prediction_length
         self.patience = patience
 
         self.num_layers = num_layers
@@ -190,9 +190,7 @@ class TimeGradEstimator(PyTorchLightningEstimator):
         self.num_feat_dynamic_real = num_feat_dynamic_real
         self.num_feat_static_cat = num_feat_static_cat
         self.num_feat_static_real = num_feat_static_real
-        self.cardinality = (
-            cardinality if cardinality and num_feat_static_cat > 0 else [1]
-        )
+        self.cardinality = cardinality if cardinality and num_feat_static_cat > 0 else [1]
         self.embedding_dimension = embedding_dimension
         self.scaling = scaling
         self.default_scale = default_scale
@@ -208,9 +206,7 @@ class TimeGradEstimator(PyTorchLightningEstimator):
         self.num_batches_per_epoch = num_batches_per_epoch
 
         self.imputation_method = (
-            imputation_method
-            if imputation_method is not None
-            else DummyValueImputation(0)
+            imputation_method if imputation_method is not None else DummyValueImputation(0)
         )
 
         self.train_sampler = train_sampler or ExpectedNumInstanceSampler(
@@ -285,18 +281,15 @@ class TimeGradEstimator(PyTorchLightningEstimator):
                 VstackFeatures(
                     output_field=FieldName.FEAT_TIME,
                     input_fields=[FieldName.FEAT_TIME, FieldName.FEAT_AGE]
-                    + (
-                        [FieldName.FEAT_DYNAMIC_REAL]
-                        if self.num_feat_dynamic_real > 0
-                        else []
-                    ),
+                    + ([FieldName.FEAT_DYNAMIC_REAL] if self.num_feat_dynamic_real > 0 else []),
                 ),
                 AsNumpyArray(FieldName.FEAT_TIME, expected_ndim=2),
             ]
         )
 
     def _create_instance_splitter(self, module: TimeGradLightningModule, mode: str):
-        assert mode in ["training", "validation", "test"]
+        if mode not in {"training", "validation", "test"}:
+            raise ValueError("mode must be training, validation, or test")
 
         instance_sampler = {
             "training": self.train_sampler,
@@ -327,9 +320,7 @@ class TimeGradEstimator(PyTorchLightningEstimator):
         **kwargs,
     ) -> Iterable:
         data = Cyclic(data).stream()
-        instances = self._create_instance_splitter(module, "training").apply(
-            data, is_train=True
-        )
+        instances = self._create_instance_splitter(module, "training").apply(data, is_train=True)
         return as_stacked_batches(
             instances,
             batch_size=self.batch_size,
@@ -345,9 +336,7 @@ class TimeGradEstimator(PyTorchLightningEstimator):
         module: TimeGradLightningModule,
         **kwargs,
     ) -> Iterable:
-        instances = self._create_instance_splitter(module, "validation").apply(
-            data, is_train=True
-        )
+        instances = self._create_instance_splitter(module, "validation").apply(data, is_train=True)
         return as_stacked_batches(
             instances,
             batch_size=self.batch_size,
@@ -356,7 +345,7 @@ class TimeGradEstimator(PyTorchLightningEstimator):
         )
 
     def create_lightning_module(self) -> TimeGradLightningModule:
-        return TimeGradLightningModule(
+        return self.lightning_module_type(
             # loss=self.loss,
             lr=self.lr,
             weight_decay=self.weight_decay,
@@ -368,9 +357,7 @@ class TimeGradEstimator(PyTorchLightningEstimator):
                 "scheduler": self.scheduler,
                 "num_inference_steps": self.num_inference_steps,
                 "input_size": self.input_size,
-                "num_feat_dynamic_real": (
-                    1 + self.num_feat_dynamic_real + len(self.time_features)
-                ),
+                "num_feat_dynamic_real": (1 + self.num_feat_dynamic_real + len(self.time_features)),
                 "num_feat_static_real": max(1, self.num_feat_static_real),
                 "num_feat_static_cat": max(1, self.num_feat_static_cat),
                 "cardinality": self.cardinality,
@@ -389,10 +376,10 @@ class TimeGradEstimator(PyTorchLightningEstimator):
         self,
         transformation: Transformation,
         module: TimeGradLightningModule,
-    ) -> PyTorchPredictor:
+    ) -> TransTimeGradPredictor:
         prediction_splitter = self._create_instance_splitter(module, "test")
 
-        return PyTorchPredictor(
+        return TransTimeGradPredictor(
             input_transform=transformation + prediction_splitter,
             input_names=PREDICTION_INPUT_NAMES,
             prediction_net=module,
